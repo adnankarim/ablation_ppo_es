@@ -78,7 +78,7 @@ class InformationMetrics:
     def entropy_multidim_gaussian(cov_matrix: np.ndarray) -> float:
         """Entropy of multivariate Gaussian: H(X) = 0.5 * ln((2πe)^d * det(Σ))
         
-        Returns entropy normalized per dimension for fair comparison.
+        Returns entroppopuly normalized per dimension for fair comparison.
         """
         cov_matrix = np.atleast_2d(cov_matrix)
         d = cov_matrix.shape[0]
@@ -361,7 +361,7 @@ class AblationConfig:
     num_sampling_steps: int = 100
     
     # ES Ablations (population size FIXED at 30)
-    es_population_size: int = 300  # FIXED (increased from 15 for better exploration)
+    es_population_size: int = 15  # FIXED (increased from 15 for better exploration)
     es_sigma_values: List[float] = field(default_factory=lambda: [0.001, 0.002, 0.005, 0.01])
     es_lr_values: List[float] = field(default_factory=lambda: [0.0001, 0.0002, 0.0005, 0.001])  # Reduced to prevent divergence
     
@@ -1163,8 +1163,33 @@ class AblationRunner:
         # Evaluate INITIAL state (before any training)
         print(f"    Evaluating initial state (before warmup)...")
         initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
+        
+        # Compute actual initial loss (before any training)
+        initial_loss = 0.0
+        with torch.no_grad():
+            for x1_batch, x2_batch in dataloader:
+                x1_batch = x1_batch.to(self.config.device)
+                x2_batch = x2_batch.to(self.config.device)
+                
+                # Compute loss for both directions
+                batch_size = x1_batch.shape[0]
+                t = torch.randint(0, cond_x1.timesteps, (batch_size,), device=self.config.device)
+                noise = torch.randn_like(x1_batch)
+                x1_t = cond_x1.q_sample(x1_batch, t, noise)
+                noise_pred1 = cond_x1.model(x1_t, t, x2_batch)
+                loss1 = nn.functional.mse_loss(noise_pred1, noise).item()
+                
+                t = torch.randint(0, cond_x2.timesteps, (batch_size,), device=self.config.device)
+                noise = torch.randn_like(x2_batch)
+                x2_t = cond_x2.q_sample(x2_batch, t, noise)
+                noise_pred2 = cond_x2.model(x2_t, t, x1_batch)
+                loss2 = nn.functional.mse_loss(noise_pred2, noise).item()
+                
+                initial_loss += (loss1 + loss2) / 2
+                break  # Just compute on first batch for speed
+        
         initial_metrics['epoch'] = 0  # Start counting from epoch 0
-        initial_metrics['loss'] = 0.0
+        initial_metrics['loss'] = initial_loss
         initial_metrics['sigma'] = sigma
         initial_metrics['lr'] = lr
         initial_metrics['phase'] = 'initial'
@@ -1382,8 +1407,42 @@ class AblationRunner:
         # Important: MI should INCREASE significantly during training (0.3 → 2.0+)
         print(f"    Evaluating initial state (before PPO training)...")
         initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
+        
+        # Compute actual initial loss (before any training)
+        initial_loss = 0.0
+        with torch.no_grad():
+            for x1_batch, x2_batch in dataloader:
+                x1_batch = x1_batch.to(self.config.device)
+                x2_batch = x2_batch.to(self.config.device)
+                
+                # Compute loss for both directions (with KL penalty)
+                batch_size = x1_batch.shape[0]
+                
+                # Direction 1: P(X1|X2)
+                t = torch.randint(0, cond_x1.timesteps, (batch_size,), device=self.config.device)
+                noise = torch.randn_like(x1_batch)
+                x1_t = cond_x1.q_sample(x1_batch, t, noise)
+                noise_pred1 = cond_x1.model(x1_t, t, x2_batch)
+                recon_loss1 = nn.functional.mse_loss(noise_pred1, noise)
+                noise_pred_anchor1 = ddpm_x1.model(x1_t, t, None)
+                kl_loss1 = nn.functional.mse_loss(noise_pred1, noise_pred_anchor1)
+                loss1 = (recon_loss1 + kl_weight * kl_loss1).item()
+                
+                # Direction 2: P(X2|X1)
+                t = torch.randint(0, cond_x2.timesteps, (batch_size,), device=self.config.device)
+                noise = torch.randn_like(x2_batch)
+                x2_t = cond_x2.q_sample(x2_batch, t, noise)
+                noise_pred2 = cond_x2.model(x2_t, t, x1_batch)
+                recon_loss2 = nn.functional.mse_loss(noise_pred2, noise)
+                noise_pred_anchor2 = ddpm_x2.model(x2_t, t, None)
+                kl_loss2 = nn.functional.mse_loss(noise_pred2, noise_pred_anchor2)
+                loss2 = (recon_loss2 + kl_weight * kl_loss2).item()
+                
+                initial_loss += (loss1 + loss2) / 2
+                break  # Just compute on first batch for speed
+        
         initial_metrics['epoch'] = 0
-        initial_metrics['loss'] = 0.0
+        initial_metrics['loss'] = initial_loss
         initial_metrics['kl_weight'] = kl_weight
         initial_metrics['ppo_clip'] = ppo_clip
         initial_metrics['lr'] = lr
