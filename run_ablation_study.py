@@ -976,15 +976,109 @@ class AblationRunner:
         if self.config.use_wandb and WANDB_AVAILABLE:
             wandb.finish()
     
+    def _evaluate_pretrain_ddpm(self, dim: int, ddpm: MultiDimDDPM, target_mu: float, target_std: float = 1.0) -> Dict:
+        """
+        Evaluate unconditional DDPM model quality.
+        
+        Computes KL divergence between generated samples and target distribution.
+        Note: At epoch 0 (random initialization), KL will be very high because the
+        untrained model generates random samples. KL decreases as the model learns
+        to match the target distribution during training.
+        """
+        num_eval = 1000
+        
+        try:
+            # Generate test data
+            x_true = torch.randn(num_eval, dim, device=self.config.device) * target_std + target_mu
+            
+            # Sample from unconditional model
+            with torch.no_grad():
+                x_gen = ddpm.sample(num_eval, None, self.config.num_sampling_steps)
+            
+            # Convert to numpy
+            x_gen_np = x_gen.cpu().numpy()
+            x_true_np = x_true.cpu().numpy()
+            
+            # Clean samples
+            def clean_samples(x: np.ndarray, expected_mean: float) -> np.ndarray:
+                x = x.copy()
+                nan_mask = ~np.isfinite(x)
+                if np.any(nan_mask):
+                    x[nan_mask] = expected_mean
+                x = np.clip(x, expected_mean - 50, expected_mean + 50)
+                return x
+            
+            x_gen_np = clean_samples(x_gen_np, target_mu)
+            
+            # Learned statistics
+            mu_learned = np.nanmean(x_gen_np, axis=0)
+            std_learned = np.nanstd(x_gen_np, axis=0) + 1e-8
+            std_learned = np.maximum(std_learned, 0.3)
+            
+            # Target statistics
+            mu_target = np.full(dim, target_mu)
+            std_target = np.full(dim, target_std)
+            
+            # KL Divergence (per-dimension)
+            kl_div = InformationMetrics.kl_divergence_gaussian(
+                mu_learned, std_learned, mu_target, std_target, per_dimension=True
+            )
+            
+            # Entropy
+            h_learned = InformationMetrics.entropy_multidim_gaussian(np.diag(std_learned ** 2))
+            h_target = InformationMetrics.entropy_multidim_gaussian(np.diag(std_target ** 2))
+            
+            # Compute loss on validation batch
+            val_loss = 0.0
+            with torch.no_grad():
+                val_batch = x_true[:128].to(self.config.device)
+                batch_size = val_batch.shape[0]
+                t = torch.randint(0, ddpm.timesteps, (batch_size,), device=self.config.device)
+                noise = torch.randn_like(val_batch)
+                x_t = ddpm.q_sample(val_batch, t, noise)
+                noise_pred = ddpm.model(x_t, t, None)
+                val_loss = nn.functional.mse_loss(noise_pred, noise).item()
+            
+            return {
+                'kl_div': float(kl_div),
+                'entropy': float(h_learned),
+                'entropy_target': float(h_target),
+                'loss': float(val_loss),
+                'mu_learned': float(np.mean(mu_learned)),
+                'std_learned': float(np.mean(std_learned)),
+                'mu_target': float(target_mu),
+                'std_target': float(target_std),
+            }
+        except Exception as e:
+            print(f"    [ERROR] Pretrain evaluation error: {e}")
+            return {
+                'kl_div': 100.0,
+                'entropy': 0.0,
+                'entropy_target': dim * 1.42,
+                'loss': 100.0,
+                'mu_learned': 0.0,
+                'std_learned': 0.0,
+                'mu_target': float(target_mu),
+                'std_target': float(target_std),
+            }
+    
     def _pretrain_ddpm(self, dim: int) -> Tuple[MultiDimDDPM, MultiDimDDPM]:
-        """Pretrain DDPM models for X1 and X2."""
+        """Pretrain DDPM models for X1 and X2 with metrics tracking."""
         # Check if models already exist in persistent directory
         model_x1_path = os.path.join(self.pretrained_models_dir, f"ddpm_x1_{dim}d.pt")
         model_x2_path = os.path.join(self.pretrained_models_dir, f"ddpm_x2_{dim}d.pt")
         
+        # Create pretraining metrics directory
+        pretrain_metrics_dir = os.path.join(self.plots_dir, f'pretrain_{dim}D')
+        os.makedirs(pretrain_metrics_dir, exist_ok=True)
+        
         # Generate training data
         x1_data = torch.randn(self.config.ddpm_num_samples, dim) * 1.0 + 2.0
         x2_data = torch.randn(self.config.ddpm_num_samples, dim) * 1.0 + 10.0
+        
+        # Track metrics for both models
+        pretrain_metrics_x1 = []
+        pretrain_metrics_x2 = []
         
         # DDPM for X1
         if self.config.reuse_pretrained and os.path.exists(model_x1_path):
@@ -998,6 +1092,12 @@ class AblationRunner:
                 conditional=False
             )
             ddpm_x1.load(model_x1_path)
+            # Evaluate loaded model
+            metrics = self._evaluate_pretrain_ddpm(dim, ddpm_x1, target_mu=2.0, target_std=1.0)
+            metrics['epoch'] = self.config.ddpm_epochs
+            metrics['model'] = 'X1'
+            metrics['phase'] = 'loaded'
+            pretrain_metrics_x1.append(metrics)
         else:
             if os.path.exists(model_x1_path):
                 print(f"  [SKIP] Existing model found but --retrain-ddpm flag set. Training from scratch...")
@@ -1016,6 +1116,29 @@ class AblationRunner:
             dataset = TensorDataset(x1_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
             
+            # Evaluate initial state (epoch 0: randomly initialized model)
+            # NOTE: KL will be very high initially because the untrained model generates
+            # random samples that don't match the target distribution (μ=2.0, σ=1.0).
+            # As training progresses, KL decreases as the model learns to match the target.
+            initial_metrics = self._evaluate_pretrain_ddpm(dim, ddpm_x1, target_mu=2.0, target_std=1.0)
+            # Compute initial loss
+            with torch.no_grad():
+                initial_batch = x1_data[:128].to(self.config.device)
+                batch_size = initial_batch.shape[0]
+                t = torch.randint(0, ddpm_x1.timesteps, (batch_size,), device=self.config.device)
+                noise = torch.randn_like(initial_batch)
+                x_t = ddpm_x1.q_sample(initial_batch, t, noise)
+                noise_pred = ddpm_x1.model(x_t, t, None)
+                initial_loss = nn.functional.mse_loss(noise_pred, noise).item()
+            initial_metrics['epoch'] = 0
+            initial_metrics['model'] = 'X1'
+            initial_metrics['phase'] = 'pretrain'
+            initial_metrics['loss'] = initial_loss
+            pretrain_metrics_x1.append(initial_metrics)
+            print(f"    Initial (epoch 0): Loss={initial_loss:.4f}, KL/dim={initial_metrics['kl_div']:.4f}, "
+                  f"μ={initial_metrics['mu_learned']:.3f}, σ={initial_metrics['std_learned']:.3f} "
+                  f"(target: μ=2.0, σ=1.0)")
+            
             for epoch in range(self.config.ddpm_epochs):
                 losses = []
                 for batch in dataloader:
@@ -1023,8 +1146,20 @@ class AblationRunner:
                     loss = ddpm_x1.train_step(x)
                     losses.append(loss)
                 
+                avg_loss = np.mean(losses)
+                
+                # Evaluate metrics periodically (every 10 epochs or at the end)
+                if (epoch + 1) % 10 == 0 or (epoch + 1) == self.config.ddpm_epochs:
+                    metrics = self._evaluate_pretrain_ddpm(dim, ddpm_x1, target_mu=2.0, target_std=1.0)
+                    metrics['epoch'] = epoch + 1
+                    metrics['model'] = 'X1'
+                    metrics['phase'] = 'pretrain'
+                    metrics['loss'] = avg_loss
+                    pretrain_metrics_x1.append(metrics)
+                
                 if (epoch + 1) % 20 == 0:
-                    print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {np.mean(losses):.4f}")
+                    print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
+                          f"KL/dim: {pretrain_metrics_x1[-1]['kl_div']:.4f}")
             
             ddpm_x1.save(model_x1_path)
             print(f"  [SAVE] Saved DDPM X1 to {model_x1_path}")
@@ -1041,6 +1176,12 @@ class AblationRunner:
                 conditional=False
             )
             ddpm_x2.load(model_x2_path)
+            # Evaluate loaded model
+            metrics = self._evaluate_pretrain_ddpm(dim, ddpm_x2, target_mu=10.0, target_std=1.0)
+            metrics['epoch'] = self.config.ddpm_epochs
+            metrics['model'] = 'X2'
+            metrics['phase'] = 'loaded'
+            pretrain_metrics_x2.append(metrics)
         else:
             if os.path.exists(model_x2_path):
                 print(f"  [SKIP] Existing model found but --retrain-ddpm flag set. Training from scratch...")
@@ -1059,6 +1200,29 @@ class AblationRunner:
             dataset = TensorDataset(x2_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
             
+            # Evaluate initial state (epoch 0: randomly initialized model)
+            # NOTE: KL will be very high initially because the untrained model generates
+            # random samples that don't match the target distribution (μ=10.0, σ=1.0).
+            # As training progresses, KL decreases as the model learns to match the target.
+            initial_metrics = self._evaluate_pretrain_ddpm(dim, ddpm_x2, target_mu=10.0, target_std=1.0)
+            # Compute initial loss
+            with torch.no_grad():
+                initial_batch = x2_data[:128].to(self.config.device)
+                batch_size = initial_batch.shape[0]
+                t = torch.randint(0, ddpm_x2.timesteps, (batch_size,), device=self.config.device)
+                noise = torch.randn_like(initial_batch)
+                x_t = ddpm_x2.q_sample(initial_batch, t, noise)
+                noise_pred = ddpm_x2.model(x_t, t, None)
+                initial_loss = nn.functional.mse_loss(noise_pred, noise).item()
+            initial_metrics['epoch'] = 0
+            initial_metrics['model'] = 'X2'
+            initial_metrics['phase'] = 'pretrain'
+            initial_metrics['loss'] = initial_loss
+            pretrain_metrics_x2.append(initial_metrics)
+            print(f"    Initial (epoch 0): Loss={initial_loss:.4f}, KL/dim={initial_metrics['kl_div']:.4f}, "
+                  f"μ={initial_metrics['mu_learned']:.3f}, σ={initial_metrics['std_learned']:.3f} "
+                  f"(target: μ=10.0, σ=1.0)")
+            
             for epoch in range(self.config.ddpm_epochs):
                 losses = []
                 for batch in dataloader:
@@ -1066,11 +1230,30 @@ class AblationRunner:
                     loss = ddpm_x2.train_step(x)
                     losses.append(loss)
                 
+                avg_loss = np.mean(losses)
+                
+                # Evaluate metrics periodically (every 10 epochs or at the end)
+                if (epoch + 1) % 10 == 0 or (epoch + 1) == self.config.ddpm_epochs:
+                    metrics = self._evaluate_pretrain_ddpm(dim, ddpm_x2, target_mu=10.0, target_std=1.0)
+                    metrics['epoch'] = epoch + 1
+                    metrics['model'] = 'X2'
+                    metrics['phase'] = 'pretrain'
+                    metrics['loss'] = avg_loss
+                    pretrain_metrics_x2.append(metrics)
+                
                 if (epoch + 1) % 20 == 0:
-                    print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {np.mean(losses):.4f}")
+                    print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
+                          f"KL/dim: {pretrain_metrics_x2[-1]['kl_div']:.4f}")
             
             ddpm_x2.save(model_x2_path)
             print(f"  [SAVE] Saved DDPM X2 to {model_x2_path}")
+        
+        # Save pretraining metrics to CSV
+        self._save_pretrain_metrics_to_csv(pretrain_metrics_x1, pretrain_metrics_x2, pretrain_metrics_dir, dim)
+        
+        # Generate pretraining plots
+        if pretrain_metrics_x1 or pretrain_metrics_x2:
+            self._plot_pretrain_metrics(pretrain_metrics_x1, pretrain_metrics_x2, pretrain_metrics_dir, dim)
         
         return ddpm_x1, ddpm_x2
     
@@ -1626,6 +1809,228 @@ class AblationRunner:
             for metrics in epoch_metrics:
                 row = {k: v for k, v in metrics.items() if k in fieldnames}
                 writer.writerow(row)
+    
+    def _save_pretrain_metrics_to_csv(self, metrics_x1: List[Dict], metrics_x2: List[Dict], 
+                                     output_dir: str, dim: int):
+        """Save pretraining metrics to CSV."""
+        import csv
+        
+        # Save X1 metrics
+        if metrics_x1:
+            csv_path_x1 = os.path.join(output_dir, 'pretrain_x1_metrics.csv')
+            fieldnames = [k for k in metrics_x1[0].keys() if k not in ['history']]
+            with open(csv_path_x1, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for metrics in metrics_x1:
+                    row = {k: v for k, v in metrics.items() if k in fieldnames}
+                    writer.writerow(row)
+        
+        # Save X2 metrics
+        if metrics_x2:
+            csv_path_x2 = os.path.join(output_dir, 'pretrain_x2_metrics.csv')
+            fieldnames = [k for k in metrics_x2[0].keys() if k not in ['history']]
+            with open(csv_path_x2, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for metrics in metrics_x2:
+                    row = {k: v for k, v in metrics.items() if k in fieldnames}
+                    writer.writerow(row)
+        
+        # Save combined metrics
+        if metrics_x1 or metrics_x2:
+            csv_path_combined = os.path.join(output_dir, 'pretrain_combined_metrics.csv')
+            all_metrics = metrics_x1 + metrics_x2
+            if all_metrics:
+                fieldnames = [k for k in all_metrics[0].keys() if k not in ['history']]
+                with open(csv_path_combined, 'w', newline='') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for metrics in all_metrics:
+                        row = {k: v for k, v in metrics.items() if k in fieldnames}
+                        writer.writerow(row)
+    
+    def _plot_pretrain_metrics(self, metrics_x1: List[Dict], metrics_x2: List[Dict], 
+                               output_dir: str, dim: int):
+        """Generate plots for pretraining phase metrics."""
+        if not metrics_x1 and not metrics_x2:
+            return
+        
+        fig = plt.figure(figsize=(20, 12))
+        gs = GridSpec(3, 3, figure=fig)
+        
+        # Helper function to extract epochs and values
+        def get_plot_data(metrics_list):
+            if not metrics_list:
+                return [], []
+            epochs = [m['epoch'] for m in metrics_list]
+            return epochs, metrics_list
+        
+        # Row 1: Loss plots
+        ax1 = fig.add_subplot(gs[0, 0])
+        if metrics_x1:
+            epochs_x1, _ = get_plot_data(metrics_x1)
+            losses_x1 = [m['loss'] for m in metrics_x1]
+            ax1.plot(epochs_x1, losses_x1, 'b-', linewidth=2, marker='o', label='X1 Loss', markersize=5)
+        if metrics_x2:
+            epochs_x2, _ = get_plot_data(metrics_x2)
+            losses_x2 = [m['loss'] for m in metrics_x2]
+            ax1.plot(epochs_x2, losses_x2, 'r-', linewidth=2, marker='s', label='X2 Loss', markersize=5)
+        ax1.set_xlabel('Epoch')
+        ax1.set_ylabel('Training Loss')
+        ax1.set_title(f'Pretraining Loss ({dim}D)')
+        ax1.legend()
+        ax1.grid(True, alpha=0.3)
+        
+        # Row 1: KL Divergence
+        ax2 = fig.add_subplot(gs[0, 1])
+        if metrics_x1:
+            epochs_x1, _ = get_plot_data(metrics_x1)
+            kl_x1 = [m['kl_div'] for m in metrics_x1]
+            ax2.plot(epochs_x1, kl_x1, 'b-', linewidth=2, marker='o', label='X1 KL/dim', markersize=5)
+        if metrics_x2:
+            epochs_x2, _ = get_plot_data(metrics_x2)
+            kl_x2 = [m['kl_div'] for m in metrics_x2]
+            ax2.plot(epochs_x2, kl_x2, 'r-', linewidth=2, marker='s', label='X2 KL/dim', markersize=5)
+        ax2.set_xlabel('Epoch')
+        ax2.set_ylabel('KL Divergence (per-dim)')
+        ax2.set_title(f'Pretraining KL Divergence ({dim}D)')
+        ax2.legend()
+        ax2.grid(True, alpha=0.3)
+        
+        # Row 1: Entropy
+        ax3 = fig.add_subplot(gs[0, 2])
+        if metrics_x1:
+            epochs_x1, _ = get_plot_data(metrics_x1)
+            entropy_x1 = [m['entropy'] for m in metrics_x1]
+            entropy_target_x1 = [m['entropy_target'] for m in metrics_x1]
+            ax3.plot(epochs_x1, entropy_x1, 'b-', linewidth=2, marker='o', label='X1 H(learned)', markersize=5)
+            ax3.plot(epochs_x1, entropy_target_x1, 'b--', linewidth=2, label='X1 H(target)', alpha=0.7)
+        if metrics_x2:
+            epochs_x2, _ = get_plot_data(metrics_x2)
+            entropy_x2 = [m['entropy'] for m in metrics_x2]
+            entropy_target_x2 = [m['entropy_target'] for m in metrics_x2]
+            ax3.plot(epochs_x2, entropy_x2, 'r-', linewidth=2, marker='s', label='X2 H(learned)', markersize=5)
+            ax3.plot(epochs_x2, entropy_target_x2, 'r--', linewidth=2, label='X2 H(target)', alpha=0.7)
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Entropy')
+        ax3.set_title(f'Pretraining Entropy ({dim}D)')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        
+        # Row 2: Learned means
+        ax4 = fig.add_subplot(gs[1, 0])
+        if metrics_x1:
+            epochs_x1, _ = get_plot_data(metrics_x1)
+            mu_x1 = [m['mu_learned'] for m in metrics_x1]
+            mu_target_x1 = [m['mu_target'] for m in metrics_x1]
+            ax4.plot(epochs_x1, mu_x1, 'b-', linewidth=2, marker='o', label='X1 μ(learned)', markersize=5)
+            ax4.axhline(y=mu_target_x1[0] if mu_target_x1 else 2.0, color='b', linestyle='--', 
+                       linewidth=2, label='X1 μ(target)', alpha=0.7)
+        if metrics_x2:
+            epochs_x2, _ = get_plot_data(metrics_x2)
+            mu_x2 = [m['mu_learned'] for m in metrics_x2]
+            mu_target_x2 = [m['mu_target'] for m in metrics_x2]
+            ax4.plot(epochs_x2, mu_x2, 'r-', linewidth=2, marker='s', label='X2 μ(learned)', markersize=5)
+            ax4.axhline(y=mu_target_x2[0] if mu_target_x2 else 10.0, color='r', linestyle='--', 
+                       linewidth=2, label='X2 μ(target)', alpha=0.7)
+        ax4.set_xlabel('Epoch')
+        ax4.set_ylabel('Mean')
+        ax4.set_title(f'Pretraining Learned Means ({dim}D)')
+        ax4.legend()
+        ax4.grid(True, alpha=0.3)
+        
+        # Row 2: Learned std devs
+        ax5 = fig.add_subplot(gs[1, 1])
+        if metrics_x1:
+            epochs_x1, _ = get_plot_data(metrics_x1)
+            std_x1 = [m['std_learned'] for m in metrics_x1]
+            std_target_x1 = [m['std_target'] for m in metrics_x1]
+            ax5.plot(epochs_x1, std_x1, 'b-', linewidth=2, marker='o', label='X1 σ(learned)', markersize=5)
+            ax5.axhline(y=std_target_x1[0] if std_target_x1 else 1.0, color='b', linestyle='--', 
+                       linewidth=2, label='X1 σ(target)', alpha=0.7)
+        if metrics_x2:
+            epochs_x2, _ = get_plot_data(metrics_x2)
+            std_x2 = [m['std_learned'] for m in metrics_x2]
+            std_target_x2 = [m['std_target'] for m in metrics_x2]
+            ax5.plot(epochs_x2, std_x2, 'r-', linewidth=2, marker='s', label='X2 σ(learned)', markersize=5)
+            ax5.axhline(y=std_target_x2[0] if std_target_x2 else 1.0, color='r', linestyle='--', 
+                       linewidth=2, label='X2 σ(target)', alpha=0.7)
+        ax5.set_xlabel('Epoch')
+        ax5.set_ylabel('Std Dev')
+        ax5.set_title(f'Pretraining Learned Std Devs ({dim}D)')
+        ax5.legend()
+        ax5.grid(True, alpha=0.3)
+        
+        # Row 2: Loss vs KL (scatter)
+        ax6 = fig.add_subplot(gs[1, 2])
+        if metrics_x1:
+            losses_x1 = [m['loss'] for m in metrics_x1]
+            kl_x1 = [m['kl_div'] for m in metrics_x1]
+            ax6.scatter(losses_x1, kl_x1, c='blue', s=50, alpha=0.6, label='X1', marker='o')
+        if metrics_x2:
+            losses_x2 = [m['loss'] for m in metrics_x2]
+            kl_x2 = [m['kl_div'] for m in metrics_x2]
+            ax6.scatter(losses_x2, kl_x2, c='red', s=50, alpha=0.6, label='X2', marker='s')
+        ax6.set_xlabel('Training Loss')
+        ax6.set_ylabel('KL Divergence (per-dim)')
+        ax6.set_title(f'Loss vs KL ({dim}D)')
+        ax6.legend()
+        ax6.grid(True, alpha=0.3)
+        
+        # Row 3: Summary statistics table
+        ax7 = fig.add_subplot(gs[2, :])
+        ax7.axis('off')
+        
+        summary_text = f"""
+DDPM Pretraining Summary - {dim}D
+{'='*80}
+
+X1 Model (Target: μ=2.0, σ=1.0):
+"""
+        if metrics_x1:
+            final_x1 = metrics_x1[-1]
+            initial_x1 = metrics_x1[0] if len(metrics_x1) > 1 else final_x1
+            summary_text += f"""
+  Initial:  Loss={initial_x1.get('loss', 0):.4f}, KL/dim={initial_x1.get('kl_div', 0):.4f}, 
+            μ={initial_x1.get('mu_learned', 0):.3f}, σ={initial_x1.get('std_learned', 0):.3f}
+  Final:    Loss={final_x1.get('loss', 0):.4f}, KL/dim={final_x1.get('kl_div', 0):.4f}, 
+            μ={final_x1.get('mu_learned', 0):.3f}, σ={final_x1.get('std_learned', 0):.3f}
+  Improvement: Loss {initial_x1.get('loss', 0) - final_x1.get('loss', 0):.4f}, 
+                KL {initial_x1.get('kl_div', 0) - final_x1.get('kl_div', 0):.4f}
+"""
+        else:
+            summary_text += "  [Model loaded from checkpoint]\n"
+        
+        summary_text += f"""
+X2 Model (Target: μ=10.0, σ=1.0):
+"""
+        if metrics_x2:
+            final_x2 = metrics_x2[-1]
+            initial_x2 = metrics_x2[0] if len(metrics_x2) > 1 else final_x2
+            summary_text += f"""
+  Initial:  Loss={initial_x2.get('loss', 0):.4f}, KL/dim={initial_x2.get('kl_div', 0):.4f}, 
+            μ={initial_x2.get('mu_learned', 0):.3f}, σ={initial_x2.get('std_learned', 0):.3f}
+  Final:    Loss={final_x2.get('loss', 0):.4f}, KL/dim={final_x2.get('kl_div', 0):.4f}, 
+            μ={final_x2.get('mu_learned', 0):.3f}, σ={final_x2.get('std_learned', 0):.3f}
+  Improvement: Loss {initial_x2.get('loss', 0) - final_x2.get('loss', 0):.4f}, 
+                KL {initial_x2.get('kl_div', 0) - final_x2.get('kl_div', 0):.4f}
+"""
+        else:
+            summary_text += "  [Model loaded from checkpoint]\n"
+        
+        ax7.text(0.1, 0.5, summary_text, fontsize=10, family='monospace',
+                verticalalignment='center', transform=ax7.transAxes,
+                bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
+        
+        plt.suptitle(f'DDPM Pretraining Metrics - {dim}D', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        
+        plot_path = os.path.join(output_dir, f'pretrain_metrics_{dim}d.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        print(f"  Pretraining plots saved: {plot_path}")
     
     def _plot_checkpoint(self, epoch_metrics: List[Dict], checkpoint_dir: str, epoch: int, method: str, dim: int, config_str: str):
         """Generate comprehensive checkpoint plot (including warmup epochs with shading)."""
