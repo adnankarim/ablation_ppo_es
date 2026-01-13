@@ -1404,55 +1404,6 @@ class AblationRunner:
         checkpoint_dir = os.path.join(self.plots_dir, f'checkpoints_ES_{dim}D_config_{config_idx}')
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # --- SMART LOADING HELPER (ES uses zero init, PPO uses random init) ---
-        def smart_load_weights(target_model, source_model, random_cond_init=False, cond_scale=1e-3):
-            """
-            Smart weight loading that handles input layer shape mismatch.
-            
-            Problem: Unconditional model has input [x, t], conditional has [x, cond, t]
-            Solution: Splice weights for conditioning input
-            
-            Args:
-                random_cond_init: If True, use small random weights (for PPO bootstrapping)
-                                 If False, use zeros (for ES warmup)
-                cond_scale: Scale for random initialization (default 1e-3)
-            """
-            pretrained_state = source_model.model.state_dict()
-            current_state = target_model.model.state_dict()
-            
-            for key in current_state.keys():
-                if key in pretrained_state:
-                    # Case 1: Shapes match (hidden layers, output layers)
-                    if pretrained_state[key].shape == current_state[key].shape:
-                        current_state[key] = pretrained_state[key].clone()
-                    
-                    # Case 2: Input layer mismatch (net.0.weight)
-                    # Uncond: [hidden, dim + t_dim] -> Cond: [hidden, 2*dim + t_dim]
-                    elif key == 'net.0.weight':
-                        pre_w = pretrained_state[key]
-                        # Split unconditional weights: x-part and t-part
-                        w_x = pre_w[:, :dim]
-                        w_t = pre_w[:, dim:]
-                        
-                        # Create weights for the condition (middle part)
-                        # Use pre_w.device to avoid device mismatch (pre_w might be on CPU if loaded with map_location)
-                        dev = pre_w.device
-                        if random_cond_init:
-                            # Small random weights for PPO bootstrapping (breaks symmetry)
-                            w_cond = cond_scale * torch.randn(pre_w.shape[0], dim, device=dev)
-                            print(f"    [SMART LOAD] Spliced random weights (scale={cond_scale}) for conditioning input in {key}")
-                        else:
-                            # Zero weights for ES warmup (model ignores condition initially)
-                            w_cond = torch.zeros(pre_w.shape[0], dim, device=dev)
-                            print(f"    [SMART LOAD] Spliced zero weights for conditioning input in {key}")
-                        
-                        # Concatenate [x, cond, t]
-                        new_w = torch.cat([w_x, w_cond, w_t], dim=1)
-                        current_state[key] = new_w
-            
-            target_model.model.load_state_dict(current_state)
-        # ----------------------------
-        
         # Create conditional models and initialize from pretrained unconditional models
         # Use fixed warmup_lr for warmup phase (separate from ES lr being ablated)
         cond_x1 = MultiDimDDPM(
@@ -1464,7 +1415,7 @@ class AblationRunner:
             conditional=True
         )
         # Apply smart loading with ZERO init for ES (ES has supervised warmup)
-        smart_load_weights(cond_x1, ddpm_x1, random_cond_init=False)
+        self.smart_load_weights(cond_x1, ddpm_x1, dim, random_cond_init=False)
         print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1")
         
         cond_x2 = MultiDimDDPM(
@@ -1476,7 +1427,7 @@ class AblationRunner:
             conditional=True
         )
         # Apply smart loading with ZERO init for ES (ES has supervised warmup)
-        smart_load_weights(cond_x2, ddpm_x2, random_cond_init=False)
+        self.smart_load_weights(cond_x2, ddpm_x2, dim, random_cond_init=False)
         print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2")
         
         # Generate training data - PAIRED (required for ES with supervised loss)
@@ -1670,55 +1621,6 @@ class AblationRunner:
         checkpoint_dir = os.path.join(self.plots_dir, f'checkpoints_PPO_{dim}D_config_{config_idx}')
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # --- SMART LOADING HELPER (Same as ES) ---
-        def smart_load_weights(target_model, source_model, random_cond_init=False, cond_scale=1e-3):
-            """
-            Smart weight loading that handles input layer shape mismatch.
-            
-            Problem: Unconditional model has input [x, t], conditional has [x, cond, t]
-            Solution: Splice weights for conditioning input
-            
-            Args:
-                random_cond_init: If True, use small random weights (for PPO bootstrapping)
-                                 If False, use zeros (for ES warmup)
-                cond_scale: Scale for random initialization (default 1e-3)
-            """
-            pretrained_state = source_model.model.state_dict()
-            current_state = target_model.model.state_dict()
-            
-            for key in current_state.keys():
-                if key in pretrained_state:
-                    # Case 1: Shapes match (hidden layers, output layers)
-                    if pretrained_state[key].shape == current_state[key].shape:
-                        current_state[key] = pretrained_state[key].clone()
-                    
-                    # Case 2: Input layer mismatch (net.0.weight)
-                    # Uncond: [hidden, dim + t_dim] -> Cond: [hidden, 2*dim + t_dim]
-                    elif key == 'net.0.weight':
-                        pre_w = pretrained_state[key]
-                        # Split unconditional weights: x-part and t-part
-                        w_x = pre_w[:, :dim]
-                        w_t = pre_w[:, dim:]
-                        
-                        # Create weights for the condition (middle part)
-                        # Use pre_w.device to avoid device mismatch (pre_w might be on CPU if loaded with map_location)
-                        dev = pre_w.device
-                        if random_cond_init:
-                            # Small random weights for PPO bootstrapping (breaks symmetry)
-                            w_cond = cond_scale * torch.randn(pre_w.shape[0], dim, device=dev)
-                            print(f"    [SMART LOAD] Spliced random weights (scale={cond_scale}) for conditioning input in {key}")
-                        else:
-                            # Zero weights for ES warmup (model ignores condition initially)
-                            w_cond = torch.zeros(pre_w.shape[0], dim, device=dev)
-                            print(f"    [SMART LOAD] Spliced zero weights for conditioning input in {key}")
-                        
-                        # Concatenate [x, cond, t]
-                        new_w = torch.cat([w_x, w_cond, w_t], dim=1)
-                        current_state[key] = new_w
-            
-            target_model.model.load_state_dict(current_state)
-        # ----------------------------
-        
         # Create conditional models and initialize from pretrained unconditional models
         cond_x1 = MultiDimDDPM(
             dim=dim,
@@ -1730,7 +1632,7 @@ class AblationRunner:
         )
         # Apply smart loading with RANDOM conditioning init for PPO bootstrapping
         # CRITICAL: Zero init makes scorer ignore condition → no reward signal → PPO can't learn
-        smart_load_weights(cond_x1, ddpm_x1, random_cond_init=True, cond_scale=1e-3)
+        self.smart_load_weights(cond_x1, ddpm_x1, dim, random_cond_init=True, cond_scale=1e-3)
         print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1 (random cond weights for PPO)")
         
         cond_x2 = MultiDimDDPM(
@@ -1742,7 +1644,7 @@ class AblationRunner:
             conditional=True
         )
         # Apply smart loading with RANDOM conditioning init for PPO bootstrapping
-        smart_load_weights(cond_x2, ddpm_x2, random_cond_init=True, cond_scale=1e-3)
+        self.smart_load_weights(cond_x2, ddpm_x2, dim, random_cond_init=True, cond_scale=1e-3)
         print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2 (random cond weights for PPO)")
         
         # Create REAL PPO trainers with specular scoring
@@ -1983,15 +1885,24 @@ class AblationRunner:
         
         csv_path = os.path.join(checkpoint_dir, 'metrics.csv')
         
-        # Get all metric keys from first entry
-        fieldnames = ['epoch', 'phase'] + [k for k in epoch_metrics[0].keys() if k not in ['epoch', 'phase', 'history']]
+        # Union of keys across all epochs (stable + complete)
+        # Prevents losing columns if later epochs add keys or initial has fewer
+        keys = set()
+        for m in epoch_metrics:
+            keys |= set(m.keys())
+        keys.discard('history')  # Exclude history (not CSV-serializable)
+        
+        # Keep epoch/phase first, rest sorted for consistency
+        rest = sorted([k for k in keys if k not in ('epoch', 'phase')])
+        fieldnames = ['epoch', 'phase'] + rest
         
         with open(csv_path, 'w', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             writer.writeheader()
             
             for metrics in epoch_metrics:
-                row = {k: v for k, v in metrics.items() if k in fieldnames}
+                # Use .get() with empty string default for missing keys
+                row = {k: metrics.get(k, "") for k in fieldnames}
                 writer.writerow(row)
     
     def _plot_checkpoint(self, epoch_metrics: List[Dict], checkpoint_dir: str, epoch: int, method: str, dim: int, config_str: str):
@@ -2357,130 +2268,177 @@ Learned vs Target:
         
         # ES: sigma vs KL
         ax1 = fig.add_subplot(gs[0, 0])
-        sigma_vals = sorted(set(r['sigma'] for r in results['ES']))
-        for sigma in sigma_vals:
-            data = [r for r in results['ES'] if r['sigma'] == sigma]
-            lrs = [r['lr'] for r in data]
-            kls = [r['kl_div_total'] for r in data]
-            ax1.plot(lrs, kls, marker='o', label=f'σ={sigma}')
-        ax1.set_xlabel('Learning Rate')
-        ax1.set_ylabel('KL Total')
-        ax1.set_title(f'ES: LR vs KL ({dim}D)')
-        ax1.set_xscale('log')
-        ax1.legend()
-        ax1.grid(True)
+        if len(results['ES']) == 0:
+            ax1.text(0.5, 0.5, f"ES skipped ({dim}D)", ha="center", va="center", fontsize=12)
+            ax1.axis("off")
+        else:
+            sigma_vals = sorted(set(r['sigma'] for r in results['ES']))
+            for sigma in sigma_vals:
+                data = [r for r in results['ES'] if r['sigma'] == sigma]
+                lrs = [r['lr'] for r in data]
+                kls = [r['kl_div_total'] for r in data]
+                ax1.plot(lrs, kls, marker='o', label=f'σ={sigma}')
+            ax1.set_xlabel('Learning Rate')
+            ax1.set_ylabel('KL Total')
+            ax1.set_title(f'ES: LR vs KL ({dim}D)')
+            ax1.set_xscale('log')
+            ax1.legend()
+            ax1.grid(True)
         
         # ES: sigma vs Correlation
         ax2 = fig.add_subplot(gs[0, 1])
-        for sigma in sigma_vals:
-            data = [r for r in results['ES'] if r['sigma'] == sigma]
-            lrs = [r['lr'] for r in data]
-            corrs = [r['correlation'] for r in data]
-            ax2.plot(lrs, corrs, marker='o', label=f'σ={sigma}')
-        ax2.set_xlabel('Learning Rate')
-        ax2.set_ylabel('Correlation')
-        ax2.set_title(f'ES: LR vs Correlation ({dim}D)')
-        ax2.set_xscale('log')
-        ax2.legend()
-        ax2.grid(True)
+        if len(results['ES']) == 0:
+            ax2.text(0.5, 0.5, f"ES skipped ({dim}D)", ha="center", va="center", fontsize=12)
+            ax2.axis("off")
+        else:
+            sigma_vals = sorted(set(r['sigma'] for r in results['ES']))
+            for sigma in sigma_vals:
+                data = [r for r in results['ES'] if r['sigma'] == sigma]
+                lrs = [r['lr'] for r in data]
+                corrs = [r['correlation'] for r in data]
+                ax2.plot(lrs, corrs, marker='o', label=f'σ={sigma}')
+            ax2.set_xlabel('Learning Rate')
+            ax2.set_ylabel('Correlation')
+            ax2.set_title(f'ES: LR vs Correlation ({dim}D)')
+            ax2.set_xscale('log')
+            ax2.legend()
+            ax2.grid(True)
         
         # ES: sigma vs MAE
         ax3 = fig.add_subplot(gs[0, 2])
-        for sigma in sigma_vals:
-            data = [r for r in results['ES'] if r['sigma'] == sigma]
-            lrs = [r['lr'] for r in data]
-            maes = [r['mae'] for r in data]
-            ax3.plot(lrs, maes, marker='o', label=f'σ={sigma}')
-        ax3.set_xlabel('Learning Rate')
-        ax3.set_ylabel('MAE')
-        ax3.set_title(f'ES: LR vs MAE ({dim}D)')
-        ax3.set_xscale('log')
-        ax3.legend()
-        ax3.grid(True)
+        if len(results['ES']) == 0:
+            ax3.text(0.5, 0.5, f"ES skipped ({dim}D)", ha="center", va="center", fontsize=12)
+            ax3.axis("off")
+        else:
+            sigma_vals = sorted(set(r['sigma'] for r in results['ES']))
+            for sigma in sigma_vals:
+                data = [r for r in results['ES'] if r['sigma'] == sigma]
+                lrs = [r['lr'] for r in data]
+                maes = [r['mae'] for r in data]
+                ax3.plot(lrs, maes, marker='o', label=f'σ={sigma}')
+            ax3.set_xlabel('Learning Rate')
+            ax3.set_ylabel('MAE')
+            ax3.set_title(f'ES: LR vs MAE ({dim}D)')
+            ax3.set_xscale('log')
+            ax3.legend()
+            ax3.grid(True)
         
         # PPO: kl_weight vs KL (aggregated over clip)
         ax4 = fig.add_subplot(gs[1, 0])
-        kl_weights = sorted(set(r['kl_weight'] for r in ppo_best))
-        for kl_w in kl_weights:
-            data = [r for r in ppo_best if r['kl_weight'] == kl_w]
-            lrs = [r['lr'] for r in data]
-            kls = [r['kl_div_total'] for r in data]
-            ax4.plot(lrs, kls, marker='o', label=f'KL_w={kl_w:.1e}')
-        ax4.set_xlabel('Learning Rate')
-        ax4.set_ylabel('KL Total')
-        ax4.set_title(f'PPO: LR vs KL ({dim}D, best over clip)')
-        ax4.set_xscale('log')
-        ax4.legend()
-        ax4.grid(True)
+        if len(ppo_best) == 0:
+            ax4.text(0.5, 0.5, f"PPO skipped ({dim}D)", ha="center", va="center", fontsize=12)
+            ax4.axis("off")
+        else:
+            kl_weights = sorted(set(r['kl_weight'] for r in ppo_best))
+            for kl_w in kl_weights:
+                data = [r for r in ppo_best if r['kl_weight'] == kl_w]
+                lrs = [r['lr'] for r in data]
+                kls = [r['kl_div_total'] for r in data]
+                ax4.plot(lrs, kls, marker='o', label=f'KL_w={kl_w:.1e}')
+            ax4.set_xlabel('Learning Rate')
+            ax4.set_ylabel('KL Total')
+            ax4.set_title(f'PPO: LR vs KL ({dim}D, best over clip)')
+            ax4.set_xscale('log')
+            ax4.legend()
+            ax4.grid(True)
         
         # PPO: kl_weight vs Correlation (aggregated over clip)
         ax5 = fig.add_subplot(gs[1, 1])
-        for kl_w in kl_weights:
-            data = [r for r in ppo_best if r['kl_weight'] == kl_w]
-            lrs = [r['lr'] for r in data]
-            corrs = [r['correlation'] for r in data]
-            ax5.plot(lrs, corrs, marker='o', label=f'KL_w={kl_w:.1e}')
-        ax5.set_xlabel('Learning Rate')
-        ax5.set_ylabel('Correlation')
-        ax5.set_title(f'PPO: LR vs Correlation ({dim}D, best over clip)')
-        ax5.set_xscale('log')
-        ax5.legend()
-        ax5.grid(True)
+        if len(ppo_best) == 0:
+            ax5.text(0.5, 0.5, f"PPO skipped ({dim}D)", ha="center", va="center", fontsize=12)
+            ax5.axis("off")
+        else:
+            kl_weights = sorted(set(r['kl_weight'] for r in ppo_best))
+            for kl_w in kl_weights:
+                data = [r for r in ppo_best if r['kl_weight'] == kl_w]
+                lrs = [r['lr'] for r in data]
+                corrs = [r['correlation'] for r in data]
+                ax5.plot(lrs, corrs, marker='o', label=f'KL_w={kl_w:.1e}')
+            ax5.set_xlabel('Learning Rate')
+            ax5.set_ylabel('Correlation')
+            ax5.set_title(f'PPO: LR vs Correlation ({dim}D, best over clip)')
+            ax5.set_xscale('log')
+            ax5.legend()
+            ax5.grid(True)
         
         # PPO: clip vs KL
         ax6 = fig.add_subplot(gs[1, 2])
-        clips = sorted(set(r['ppo_clip'] for r in results['PPO']))
-        for clip in clips:
-            data = [r for r in results['PPO'] if r['ppo_clip'] == clip]
-            lrs = [r['lr'] for r in data]
-            kls = [r['kl_div_total'] for r in data]
-            ax6.plot(lrs, kls, marker='o', label=f'Clip={clip}')
-        ax6.set_xlabel('Learning Rate')
-        ax6.set_ylabel('KL Total')
-        ax6.set_title(f'PPO: Clip vs KL ({dim}D)')
-        ax6.set_xscale('log')
-        ax6.legend()
-        ax6.grid(True)
+        if len(results['PPO']) == 0:
+            ax6.text(0.5, 0.5, f"PPO skipped ({dim}D)", ha="center", va="center", fontsize=12)
+            ax6.axis("off")
+        else:
+            clips = sorted(set(r['ppo_clip'] for r in results['PPO']))
+            for clip in clips:
+                data = [r for r in results['PPO'] if r['ppo_clip'] == clip]
+                lrs = [r['lr'] for r in data]
+                kls = [r['kl_div_total'] for r in data]
+                ax6.plot(lrs, kls, marker='o', label=f'Clip={clip}')
+            ax6.set_xlabel('Learning Rate')
+            ax6.set_ylabel('KL Total')
+            ax6.set_title(f'PPO: Clip vs KL ({dim}D)')
+            ax6.set_xscale('log')
+            ax6.legend()
+            ax6.grid(True)
         
         # Heatmap: ES sigma vs lr (KL)
         ax7 = fig.add_subplot(gs[2, 0])
-        sigma_vals = sorted(set(r['sigma'] for r in results['ES']))
-        lr_vals = sorted(set(r['lr'] for r in results['ES']))
-        heatmap_data = np.zeros((len(sigma_vals), len(lr_vals)))
-        for i, sigma in enumerate(sigma_vals):
-            for j, lr in enumerate(lr_vals):
-                matching = [r for r in results['ES'] if r['sigma'] == sigma and r['lr'] == lr]
-                if matching:
-                    heatmap_data[i, j] = matching[0]['kl_div_total']
-        im = ax7.imshow(heatmap_data, aspect='auto', cmap='viridis')
-        ax7.set_xticks(range(len(lr_vals)))
-        ax7.set_yticks(range(len(sigma_vals)))
-        ax7.set_xticklabels([f'{lr:.4f}' for lr in lr_vals], rotation=45)
-        ax7.set_yticklabels([f'{sigma:.4f}' for sigma in sigma_vals])
-        ax7.set_xlabel('Learning Rate')
-        ax7.set_ylabel('Sigma')
-        ax7.set_title(f'ES: KL Heatmap ({dim}D)')
-        plt.colorbar(im, ax=ax7)
+        if len(results['ES']) == 0:
+            ax7.text(0.5, 0.5, f"No ES results ({dim}D)", ha="center", va="center", fontsize=12)
+            ax7.axis("off")
+        else:
+            sigma_vals = sorted(set(r['sigma'] for r in results['ES']))
+            lr_vals = sorted(set(r['lr'] for r in results['ES']))
+            if len(sigma_vals) == 0 or len(lr_vals) == 0:
+                ax7.text(0.5, 0.5, f"No ES results ({dim}D)", ha="center", va="center", fontsize=12)
+                ax7.axis("off")
+            else:
+                heatmap_data = np.zeros((len(sigma_vals), len(lr_vals)))
+                for i, sigma in enumerate(sigma_vals):
+                    for j, lr in enumerate(lr_vals):
+                        matching = [r for r in results['ES'] if r['sigma'] == sigma and r['lr'] == lr]
+                        if matching:
+                            heatmap_data[i, j] = matching[0]['kl_div_total']
+                        else:
+                            heatmap_data[i, j] = np.nan
+                im = ax7.imshow(heatmap_data, aspect='auto', cmap='viridis')
+                ax7.set_xticks(range(len(lr_vals)))
+                ax7.set_yticks(range(len(sigma_vals)))
+                ax7.set_xticklabels([f'{lr:.4f}' for lr in lr_vals], rotation=45)
+                ax7.set_yticklabels([f'{sigma:.4f}' for sigma in sigma_vals])
+                ax7.set_xlabel('Learning Rate')
+                ax7.set_ylabel('Sigma')
+                ax7.set_title(f'ES: KL Heatmap ({dim}D)')
+                plt.colorbar(im, ax=ax7)
         
         # Heatmap: PPO kl_weight vs lr (KL, aggregated over clip)
         ax8 = fig.add_subplot(gs[2, 1])
-        kl_weights = sorted(set(r['kl_weight'] for r in ppo_best))
-        lr_vals_ppo = sorted(set(r['lr'] for r in ppo_best))
-        heatmap_data = np.zeros((len(kl_weights), len(lr_vals_ppo)))
-        for i, kl_w in enumerate(kl_weights):
-            for j, lr in enumerate(lr_vals_ppo):
-                matching = [r for r in ppo_best if r['kl_weight'] == kl_w and r['lr'] == lr]
-                if matching:
-                    heatmap_data[i, j] = matching[0]['kl_div_total']
-        im = ax8.imshow(heatmap_data, aspect='auto', cmap='viridis')
-        ax8.set_xticks(range(len(lr_vals_ppo)))
-        ax8.set_yticks(range(len(kl_weights)))
-        ax8.set_xticklabels([f'{lr:.5f}' for lr in lr_vals_ppo], rotation=45)
-        ax8.set_yticklabels([f'{kl_w:.1e}' for kl_w in kl_weights])
-        ax8.set_xlabel('Learning Rate')
-        ax8.set_ylabel('KL Weight')
-        ax8.set_title(f'PPO: KL Heatmap ({dim}D, best over clip)')
-        plt.colorbar(im, ax=ax8)
+        if len(ppo_best) == 0:
+            ax8.text(0.5, 0.5, f"No PPO results ({dim}D)", ha="center", va="center", fontsize=12)
+            ax8.axis("off")
+        else:
+            kl_weights = sorted(set(r['kl_weight'] for r in ppo_best))
+            lr_vals_ppo = sorted(set(r['lr'] for r in ppo_best))
+            if len(kl_weights) == 0 or len(lr_vals_ppo) == 0:
+                ax8.text(0.5, 0.5, f"No PPO results ({dim}D)", ha="center", va="center", fontsize=12)
+                ax8.axis("off")
+            else:
+                heatmap_data = np.zeros((len(kl_weights), len(lr_vals_ppo)))
+                for i, kl_w in enumerate(kl_weights):
+                    for j, lr in enumerate(lr_vals_ppo):
+                        matching = [r for r in ppo_best if r['kl_weight'] == kl_w and r['lr'] == lr]
+                        if matching:
+                            heatmap_data[i, j] = matching[0]['kl_div_total']
+                        else:
+                            heatmap_data[i, j] = np.nan
+                im = ax8.imshow(heatmap_data, aspect='auto', cmap='viridis')
+                ax8.set_xticks(range(len(lr_vals_ppo)))
+                ax8.set_yticks(range(len(kl_weights)))
+                ax8.set_xticklabels([f'{lr:.5f}' for lr in lr_vals_ppo], rotation=45)
+                ax8.set_yticklabels([f'{kl_w:.1e}' for kl_w in kl_weights])
+                ax8.set_xlabel('Learning Rate')
+                ax8.set_ylabel('KL Weight')
+                ax8.set_title(f'PPO: KL Heatmap ({dim}D, best over clip)')
+                plt.colorbar(im, ax=ax8)
         
         # Check which methods exist
         has_es = len(results['ES']) > 0
@@ -2493,28 +2451,6 @@ Learned vs Target:
         def safe_get(best, key, default=0.0):
             """Safely get value from best config, returning default if None."""
             return float(best.get(key, default)) if best is not None else float(default)
-        
-        # Guard ES-only plots
-        if not has_es:
-            ax1.set_title(f'ES skipped ({dim}D)')
-            ax1.axis('off')
-            ax2.set_title(f'ES skipped ({dim}D)')
-            ax2.axis('off')
-            ax3.set_title(f'ES skipped ({dim}D)')
-            ax3.axis('off')
-            ax7.set_title(f'ES skipped ({dim}D)')
-            ax7.axis('off')
-        
-        # Guard PPO-only plots
-        if not has_ppo:
-            ax4.set_title(f'PPO skipped ({dim}D)')
-            ax4.axis('off')
-            ax5.set_title(f'PPO skipped ({dim}D)')
-            ax5.axis('off')
-            ax6.set_title(f'PPO skipped ({dim}D)')
-            ax6.axis('off')
-            ax8.set_title(f'PPO skipped ({dim}D)')
-            ax8.axis('off')
         
         # Best configs comparison
         ax9 = fig.add_subplot(gs[2, 2])
