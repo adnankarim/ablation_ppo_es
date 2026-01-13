@@ -984,15 +984,15 @@ class ESTrainer:
             
             # Also track components for logging
             if i == 0:  # Only compute components once (for efficiency)
-                # Recompute with base params to get reward/KL
+                # Recompute with base params to get reward/KL (KL on rollout states X_t)
                 vector_to_parameters(base_params, self.actor.model.parameters())
                 self.actor.model.eval()
                 with torch.no_grad():
-                    x_gen = self._collect_rollout(y_cond)
-                    reward = self._compute_reward(y_cond, x_gen)
-                    kl_penalty = self._compute_kl_penalty(y_cond)
-                    rewards.append(reward.mean().item())
-                    kls.append(kl_penalty)
+                    x0, X_t, T_t = self._collect_rollout_with_buffers(y_cond)
+                    reward = self._compute_reward(y_cond, x0)
+                    kl_penalty = self._compute_anchor_kl(X_t, T_t, y_cond)
+                    rewards.append(float(reward.mean().item()))
+                    kls.append(float(kl_penalty))
         
         # Restore base parameters
         vector_to_parameters(base_params, self.actor.model.parameters())
@@ -1273,11 +1273,19 @@ class DDMECPPOTrainer:
         x0 = x
         return x0, xs_t, ts, xs_prev, old_logps
 
-    def train_step(self, y_cond: torch.Tensor) -> Dict[str, float]:
+    def train_step(self, y_cond: torch.Tensor, seed: Optional[int] = None) -> Dict[str, float]:
         """
         One DDMEC PPO update for actor using scorer reward.
         y_cond is REAL sample from the marginal of the conditioning variable.
+        seed: Optional random seed for reproducibility (matches ES for fairness).
         """
+        # Set seed if provided (for fairness with ES common random numbers)
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(seed)
+            np.random.seed(seed % (2**32 - 1))
+        
         # 1) rollout using current actor
         x_gen, xs_t, ts, xs_prev, old_logps = self._collect_rollout(y_cond)
 
@@ -1806,19 +1814,11 @@ class AblationRunner:
                 seed = epoch * 10000 + step
                 
                 # Phase A: update θ = P(X1|X2), scorer = φ fixed
-                for p in cond_x2.model.parameters():
-                    p.requires_grad = False
-                for p in cond_x1.model.parameters():
-                    p.requires_grad = True
-                
+                # Note: requires_grad toggles don't affect ES (it uses vector_to_parameters, not autograd)
+                # But kept for code clarity/symmetry with PPO
                 log_a = es_x1.train_step(y_cond=x2_batch, seed=seed)
                 
                 # Phase B: update φ = P(X2|X1), scorer = θ fixed
-                for p in cond_x1.model.parameters():
-                    p.requires_grad = False
-                for p in cond_x2.model.parameters():
-                    p.requires_grad = True
-                
                 # Use different seed for phase B (but deterministic)
                 log_b = es_x2.train_step(y_cond=x1_batch, seed=seed + 1000000)
                 
@@ -1960,10 +1960,13 @@ class AblationRunner:
             epoch_logs = []
             
             # Sample fresh unpaired marginals for each update (much faster than dataloader)
-            for _ in range(self.config.ppo_updates_per_epoch):
+            for step in range(self.config.ppo_updates_per_epoch):
                 # Sample unpaired marginals on-the-fly
                 x1_batch = torch.randn(self.config.coupling_batch_size, dim, device=self.config.device) * 1.0 + 2.0
                 x2_batch = torch.randn(self.config.coupling_batch_size, dim, device=self.config.device) * 1.0 + 10.0
+                
+                # Use same seed pattern as ES for fairness
+                seed = epoch * 10000 + step
                 
                 # -------------------------
                 # Phase A: update theta = P(X1|X2), scorer = phi fixed
@@ -1973,8 +1976,6 @@ class AblationRunner:
                 for p in cond_x1.model.parameters():
                     p.requires_grad = True
                 
-                # Use same seed pattern as ES for fairness
-                seed = epoch * 10000 + step
                 log_a = ppo_x1.train_step(y_cond=x2_batch, seed=seed)
                 
                 # -------------------------
