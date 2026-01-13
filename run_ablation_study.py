@@ -1161,8 +1161,16 @@ class AblationRunner:
         
         start_time = time.time()
         
+        # Filter dimensions if only_dim is specified
+        dimensions_to_run = self.config.dimensions
+        if hasattr(self.config, 'only_dim') and self.config.only_dim is not None:
+            if self.config.only_dim not in self.config.dimensions:
+                print(f"WARNING: --only-dim {self.config.only_dim} not in dimensions list. Ignoring.")
+            else:
+                dimensions_to_run = [self.config.only_dim]
+        
         # For each dimension
-        for dim in self.config.dimensions:
+        for dim in dimensions_to_run:
             print(f"\n{'='*80}")
             print(f"DIMENSION: {dim}D")
             print(f"{'='*80}\n")
@@ -1177,38 +1185,56 @@ class AblationRunner:
             ddpm_x1, ddpm_x2 = self._pretrain_ddpm(dim)
             
             # ES Ablations
-            print(f"\n[{dim}D] Step 2: ES Ablations...")
-            es_configs = list(itertools.product(
-                self.config.es_sigma_values,
-                self.config.es_lr_values
-            ))
-            
-            for i, (sigma, lr) in enumerate(es_configs):
-                print(f"\n  ES Config {i+1}/{len(es_configs)}: sigma={sigma}, lr={lr}")
-                result = self._run_es_experiment(
-                    dim, ddpm_x1, ddpm_x2, sigma, lr, i
-                )
-                result['sigma'] = sigma
-                result['lr'] = lr
-                dim_results['ES'].append(result)
+            if hasattr(self.config, 'only_method') and self.config.only_method == "PPO":
+                print(f"\n[{dim}D] Step 2: ES Ablations... SKIPPED (--only-method PPO)")
+                dim_results['ES'] = []
+            else:
+                print(f"\n[{dim}D] Step 2: ES Ablations...")
+                es_configs = list(itertools.product(
+                    self.config.es_sigma_values,
+                    self.config.es_lr_values
+                ))
+                
+                # Limit configs if max_es_configs is specified
+                if hasattr(self.config, 'max_es_configs') and self.config.max_es_configs is not None:
+                    es_configs = es_configs[:self.config.max_es_configs]
+                    print(f"  [LIMIT] Running only first {len(es_configs)} ES configs (--max-es-configs)")
+                
+                for i, (sigma, lr) in enumerate(es_configs):
+                    print(f"\n  ES Config {i+1}/{len(es_configs)}: sigma={sigma}, lr={lr}")
+                    result = self._run_es_experiment(
+                        dim, ddpm_x1, ddpm_x2, sigma, lr, i
+                    )
+                    result['sigma'] = sigma
+                    result['lr'] = lr
+                    dim_results['ES'].append(result)
             
             # PPO Ablations
-            print(f"\n[{dim}D] Step 3: PPO Ablations...")
-            ppo_configs = list(itertools.product(
-                self.config.ppo_kl_weight_values,
-                self.config.ppo_clip_values,
-                self.config.ppo_lr_values
-            ))
-            
-            for i, (kl_weight, ppo_clip, lr) in enumerate(ppo_configs):
-                print(f"\n  PPO Config {i+1}/{len(ppo_configs)}: kl_weight={kl_weight}, clip={ppo_clip}, lr={lr}")
-                result = self._run_ppo_experiment(
-                    dim, ddpm_x1, ddpm_x2, kl_weight, ppo_clip, lr, i
-                )
-                result['kl_weight'] = kl_weight
-                result['ppo_clip'] = ppo_clip
-                result['lr'] = lr
-                dim_results['PPO'].append(result)
+            if hasattr(self.config, 'only_method') and self.config.only_method == "ES":
+                print(f"\n[{dim}D] Step 3: PPO Ablations... SKIPPED (--only-method ES)")
+                dim_results['PPO'] = []
+            else:
+                print(f"\n[{dim}D] Step 3: PPO Ablations...")
+                ppo_configs = list(itertools.product(
+                    self.config.ppo_kl_weight_values,
+                    self.config.ppo_clip_values,
+                    self.config.ppo_lr_values
+                ))
+                
+                # Limit configs if max_ppo_configs is specified
+                if hasattr(self.config, 'max_ppo_configs') and self.config.max_ppo_configs is not None:
+                    ppo_configs = ppo_configs[:self.config.max_ppo_configs]
+                    print(f"  [LIMIT] Running only first {len(ppo_configs)} PPO configs (--max-ppo-configs)")
+                
+                for i, (kl_weight, ppo_clip, lr) in enumerate(ppo_configs):
+                    print(f"\n  PPO Config {i+1}/{len(ppo_configs)}: kl_weight={kl_weight}, clip={ppo_clip}, lr={lr}")
+                    result = self._run_ppo_experiment(
+                        dim, ddpm_x1, ddpm_x2, kl_weight, ppo_clip, lr, i
+                    )
+                    result['kl_weight'] = kl_weight
+                    result['ppo_clip'] = ppo_clip
+                    result['lr'] = lr
+                    dim_results['PPO'].append(result)
             
             # Store results
             self.all_results[dim] = dim_results
@@ -1426,9 +1452,14 @@ class AblationRunner:
         # Initialize metrics tracking (includes warmup + ES training)
         epoch_metrics = []
         
+        # Generate frozen eval set for consistent evaluation across epochs
+        num_eval = 1000
+        eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
+        eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
+        
         # Evaluate INITIAL state (before any training)
         print(f"    Evaluating initial state (before warmup)...")
-        initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
+        initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
         
         # Compute actual initial loss (before any training)
         initial_loss = 0.0
@@ -1495,7 +1526,7 @@ class AblationRunner:
                     warmup_losses.append((loss1 + loss2) / 2)
                 
                 # Evaluate metrics during warmup
-                metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
+                metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
                 metrics['epoch'] = warmup_epoch + 1  # Consecutive numbering: 1, 2, 3...
                 metrics['loss'] = np.mean(warmup_losses)
                 metrics['sigma'] = sigma
@@ -1546,7 +1577,7 @@ class AblationRunner:
                 epoch_losses.append((loss1 + loss2) / 2)
             
             # Evaluate
-            metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
+            metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
             metrics['epoch'] = self.config.warmup_epochs + epoch + 1  # Continue numbering after warmup
             metrics['loss'] = np.mean(epoch_losses)
             metrics['sigma'] = sigma
@@ -1689,9 +1720,14 @@ class AblationRunner:
         # Training loop
         epoch_metrics = []
         
+        # Generate frozen eval set for consistent evaluation across epochs
+        num_eval = 1000
+        eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
+        eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
+        
         # Evaluate INITIAL state (epoch 0)
         print(f"    Evaluating initial state (before PPO training)...")
-        initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
+        initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
         
         initial_metrics['epoch'] = 0
         initial_metrics['loss'] = 0.0  # Will be computed from reward
@@ -1749,7 +1785,7 @@ class AblationRunner:
                 epoch_logs.append(0.5 * (log_a["reward_mean"] + log_b["reward_mean"]))
             
             # Evaluate coupling quality after both phases
-            metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
+            metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
             metrics['epoch'] = epoch + 1  # Epochs: 1, 2, 3... (epoch 0 is initial)
             metrics['loss'] = float(-np.mean(epoch_logs))  # Higher reward => lower "loss" for plotting
             metrics['kl_weight'] = kl_weight
@@ -1781,9 +1817,18 @@ class AblationRunner:
         return final_metrics
     
     def _evaluate_coupling(self, dim: int, cond_x1: MultiDimDDPM, cond_x2: MultiDimDDPM, 
-                          is_initial: bool = False) -> Dict:
+                          is_initial: bool = False, x1_true: torch.Tensor = None, 
+                          x2_true: torch.Tensor = None) -> Dict:
         """
         Evaluate coupling quality with robust error handling.
+        
+        Args:
+            dim: Dimension
+            cond_x1: Conditional model for X1|X2
+            cond_x2: Conditional model for X2|X1
+            is_initial: Whether this is initial evaluation
+            x1_true: Optional frozen test set for X1 (if None, generates new)
+            x2_true: Optional frozen test set for X2 (if None, generates new)
         
         Note: We don't shuffle conditioning at initialization because:
         - Shuffling breaks the model's ability to generate reasonable samples (KL explodes)
@@ -1793,10 +1838,12 @@ class AblationRunner:
         num_eval = 1000
         
         try:
-            # Generate test data with slight noise for MI to be finite
-            # Deterministic coupling (x2 = x1 + 8) makes MI infinite; add small noise
-            x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
-            x2_true = x1_true + 8.0 + 0.1 * torch.randn_like(x1_true)  # Add noise for finite MI
+            # Use frozen test set if provided, otherwise generate new
+            if x1_true is None or x2_true is None:
+                # Generate test data with slight noise for MI to be finite
+                # Deterministic coupling (x2 = x1 + 8) makes MI infinite; add small noise
+                x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
+                x2_true = x1_true + 8.0 + 0.1 * torch.randn_like(x1_true)  # Add noise for finite MI
             
             # Sample from conditional models with error handling
             # Always use proper conditioning (no shuffling)
@@ -1836,6 +1883,7 @@ class AblationRunner:
                     'mu2_learned': 0.0,
                     'std1_learned': 0.0,
                     'std2_learned': 0.0,
+                    'dim': dim,
                 }
             
             # Compute metrics
@@ -1846,6 +1894,9 @@ class AblationRunner:
                 x2_true_np,
                 dim=dim
             )
+            
+            # Add dimension to metrics for scoring normalization
+            metrics['dim'] = dim
             
             return metrics
             
@@ -1875,6 +1926,7 @@ class AblationRunner:
                 'mu2_learned': 0.0,
                 'std1_learned': 0.0,
                 'std2_learned': 0.0,
+                'dim': dim,
             }
     
     def _save_metrics_to_csv(self, epoch_metrics: List[Dict], checkpoint_dir: str, method: str, dim: int):
@@ -2130,11 +2182,17 @@ Learned vs Target:
         Score configuration: lower is better.
         Uses MAE (primary) + correlation/MI (secondary) with mild KL constraint.
         This prevents selecting models that ignore conditioning (low KL but high MAE).
+        
+        CRITICAL: MI is normalized by dimension to prevent dimension bias.
         """
         mae = metrics.get('mae', float('inf'))
         kl = metrics.get('kl_div_total', float('inf'))
         corr = metrics.get('correlation', 0.0)
         mi = metrics.get('mutual_information', 0.0)
+        dim = max(1, int(metrics.get('dim', 1)))  # Get dimension from metrics
+        
+        # Normalize MI by dimension to prevent dimension bias
+        mi_norm = mi / dim
         
         # Penalize high MAE (coupling failure), high KL (marginal divergence)
         # Reward high correlation and MI (coupling success)
@@ -2142,7 +2200,7 @@ Learned vs Target:
             3.0 * mae +                    # coupling accuracy (most important)
             0.2 * kl -                     # keep marginals sane (mild constraint)
             1.0 * corr -                   # reward coupling
-            0.2 * mi                       # reward mutual information
+            0.2 * mi_norm                  # reward mutual information (normalized per dim)
         )
         return score
     
@@ -2219,6 +2277,18 @@ Learned vs Target:
         """Generate comprehensive ablation plots for a dimension with ALL metrics."""
         results = self.all_results[dim]
         
+        # Helper to aggregate PPO results over clip (best over clip for each kl_weight, lr)
+        def best_over_clip(rows):
+            """Select best config across clip values using scoring function."""
+            return min(rows, key=self._score_config)
+        
+        # Aggregate PPO results: for each (kl_weight, lr), take best over clip
+        ppo_agg = {}
+        for r in results['PPO']:
+            key = (r['kl_weight'], r['lr'])
+            ppo_agg.setdefault(key, []).append(r)
+        ppo_best = [best_over_clip(v) for v in ppo_agg.values()]
+        
         # Main ablation plot (expanded from 9 to 16 subplots + text panel)
         fig = plt.figure(figsize=(28, 24))
         gs = GridSpec(5, 4, figure=fig)  # 5 rows to accommodate text panel
@@ -2266,31 +2336,31 @@ Learned vs Target:
         ax3.legend()
         ax3.grid(True)
         
-        # PPO: kl_weight vs KL
+        # PPO: kl_weight vs KL (aggregated over clip)
         ax4 = fig.add_subplot(gs[1, 0])
-        kl_weights = sorted(set(r['kl_weight'] for r in results['PPO']))
+        kl_weights = sorted(set(r['kl_weight'] for r in ppo_best))
         for kl_w in kl_weights:
-            data = [r for r in results['PPO'] if r['kl_weight'] == kl_w]
+            data = [r for r in ppo_best if r['kl_weight'] == kl_w]
             lrs = [r['lr'] for r in data]
             kls = [r['kl_div_total'] for r in data]
-            ax4.plot(lrs, kls, marker='o', label=f'KL_w={kl_w}')
+            ax4.plot(lrs, kls, marker='o', label=f'KL_w={kl_w:.1e}')
         ax4.set_xlabel('Learning Rate')
         ax4.set_ylabel('KL Total')
-        ax4.set_title(f'PPO: LR vs KL ({dim}D)')
+        ax4.set_title(f'PPO: LR vs KL ({dim}D, best over clip)')
         ax4.set_xscale('log')
         ax4.legend()
         ax4.grid(True)
         
-        # PPO: kl_weight vs Correlation
+        # PPO: kl_weight vs Correlation (aggregated over clip)
         ax5 = fig.add_subplot(gs[1, 1])
         for kl_w in kl_weights:
-            data = [r for r in results['PPO'] if r['kl_weight'] == kl_w]
+            data = [r for r in ppo_best if r['kl_weight'] == kl_w]
             lrs = [r['lr'] for r in data]
             corrs = [r['correlation'] for r in data]
-            ax5.plot(lrs, corrs, marker='o', label=f'KL_w={kl_w}')
+            ax5.plot(lrs, corrs, marker='o', label=f'KL_w={kl_w:.1e}')
         ax5.set_xlabel('Learning Rate')
         ax5.set_ylabel('Correlation')
-        ax5.set_title(f'PPO: LR vs Correlation ({dim}D)')
+        ax5.set_title(f'PPO: LR vs Correlation ({dim}D, best over clip)')
         ax5.set_xscale('log')
         ax5.legend()
         ax5.grid(True)
@@ -2330,14 +2400,14 @@ Learned vs Target:
         ax7.set_title(f'ES: KL Heatmap ({dim}D)')
         plt.colorbar(im, ax=ax7)
         
-        # Heatmap: PPO kl_weight vs lr (KL)
+        # Heatmap: PPO kl_weight vs lr (KL, aggregated over clip)
         ax8 = fig.add_subplot(gs[2, 1])
-        kl_weights = sorted(set(r['kl_weight'] for r in results['PPO']))
-        lr_vals_ppo = sorted(set(r['lr'] for r in results['PPO']))
+        kl_weights = sorted(set(r['kl_weight'] for r in ppo_best))
+        lr_vals_ppo = sorted(set(r['lr'] for r in ppo_best))
         heatmap_data = np.zeros((len(kl_weights), len(lr_vals_ppo)))
         for i, kl_w in enumerate(kl_weights):
             for j, lr in enumerate(lr_vals_ppo):
-                matching = [r for r in results['PPO'] if r['kl_weight'] == kl_w and r['lr'] == lr]
+                matching = [r for r in ppo_best if r['kl_weight'] == kl_w and r['lr'] == lr]
                 if matching:
                     heatmap_data[i, j] = matching[0]['kl_div_total']
         im = ax8.imshow(heatmap_data, aspect='auto', cmap='viridis')
@@ -2347,7 +2417,7 @@ Learned vs Target:
         ax8.set_yticklabels([f'{kl_w:.1e}' for kl_w in kl_weights])
         ax8.set_xlabel('Learning Rate')
         ax8.set_ylabel('KL Weight')
-        ax8.set_title(f'PPO: KL Heatmap ({dim}D)')
+        ax8.set_title(f'PPO: KL Heatmap ({dim}D, best over clip)')
         plt.colorbar(im, ax=ax8)
         
         # Best configs comparison
@@ -2723,6 +2793,16 @@ def main():
     parser.add_argument("--no-reuse-pretrained", dest='reuse_pretrained', action="store_false",
                        help="Same as --retrain-ddpm (train from scratch)")
     
+    # Subsetting controls (for job arrays / incremental ablations)
+    parser.add_argument("--only-dim", type=int, default=None,
+                       help="Run only a single dimension (for job arrays)")
+    parser.add_argument("--only-method", type=str, choices=["ES", "PPO", "BOTH"], default="BOTH",
+                       help="Run only ES, only PPO, or both (default: BOTH)")
+    parser.add_argument("--max-es-configs", type=int, default=None,
+                       help="Limit number of ES configs to test (for quick runs)")
+    parser.add_argument("--max-ppo-configs", type=int, default=None,
+                       help="Limit number of PPO configs to test (for quick runs)")
+    
     args = parser.parse_args()
     
     # Handle retrain-ddpm flag (alias for no-reuse-pretrained)
@@ -2748,6 +2828,12 @@ def main():
         seed=args.seed,
         reuse_pretrained=args.reuse_pretrained,
     )
+    
+    # Add subsetting controls as attributes (not part of AblationConfig class)
+    config.only_dim = args.only_dim
+    config.only_method = args.only_method
+    config.max_es_configs = args.max_es_configs
+    config.max_ppo_configs = args.max_ppo_configs
     
     # Run ablation study
     runner = AblationRunner(config)
