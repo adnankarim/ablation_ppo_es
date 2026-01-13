@@ -38,6 +38,7 @@ import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
+from torch.nn.utils import parameters_to_vector, vector_to_parameters
 
 import matplotlib
 matplotlib.use('Agg')
@@ -420,8 +421,8 @@ class MultiDimMLP(nn.Module):
             nn.Linear(hidden_dim, dim),
         )
     
-    def forward(self, x: torch.Tensor, t: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
-        t_norm = t.float().unsqueeze(-1) / 1000.0
+    def forward(self, x: torch.Tensor, t: torch.Tensor, t_scale: float, condition: torch.Tensor = None) -> torch.Tensor:
+        t_norm = t.float().unsqueeze(-1) / t_scale
         t_emb = self.time_embed(t_norm)
         inp = torch.cat([x, t_emb], dim=-1)
         return self.net(inp)
@@ -453,8 +454,8 @@ class ConditionalMultiDimMLP(nn.Module):
             nn.Linear(hidden_dim, dim),
         )
     
-    def forward(self, x: torch.Tensor, t: torch.Tensor, condition: torch.Tensor = None) -> torch.Tensor:
-        t_norm = t.float().unsqueeze(-1) / 1000.0
+    def forward(self, x: torch.Tensor, t: torch.Tensor, t_scale: float, condition: torch.Tensor = None) -> torch.Tensor:
+        t_norm = t.float().unsqueeze(-1) / t_scale
         t_emb = self.time_embed(t_norm)
         
         if condition is None:
@@ -489,6 +490,9 @@ class MultiDimDDPM:
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         
         self.register_schedule(betas, alphas, alphas_cumprod)
+        
+        # Time scale for normalization (correct: use timesteps-1, not hardcoded 1000)
+        self.t_scale = float(max(1, timesteps - 1))
         
         # Model
         if conditional:
@@ -531,7 +535,10 @@ class MultiDimDDPM:
         x_t = self.q_sample(x0, t, noise)
         
         # Predict noise
-        noise_pred = self.model(x_t, t, condition)
+        if self.conditional:
+            noise_pred = self.model(x_t, t, self.t_scale, condition)
+        else:
+            noise_pred = self.model(x_t, t, self.t_scale)
         
         # Loss
         loss = nn.functional.mse_loss(noise_pred, noise)
@@ -560,13 +567,16 @@ class MultiDimDDPM:
                 condition = condition.repeat(num_samples, 1)
         
         # Reverse diffusion
-        step_size = self.timesteps // num_steps
+        step_size = max(1, self.timesteps // max(1, num_steps))
         
         for i in reversed(range(0, self.timesteps, step_size)):
             t = torch.full((num_samples,), i, device=self.device, dtype=torch.long)
             
             # Predict noise
-            noise_pred = self.model(x, t, condition)
+            if self.conditional:
+                noise_pred = self.model(x, t, self.t_scale, condition)
+            else:
+                noise_pred = self.model(x, t, self.t_scale)
             
             # Clamp noise prediction to prevent explosion
             noise_pred = torch.clamp(noise_pred, -10.0, 10.0)
@@ -684,17 +694,9 @@ class ESTrainer:
         if not np.all(np.isfinite(params)):
             return -float('inf')  # Worst fitness for invalid params
         
-        # Load parameters into model
-        state_dict = self.ddpm.model.state_dict()
-        offset = 0
-        for key in state_dict.keys():
-            param_size = state_dict[key].numel()
-            state_dict[key] = torch.from_numpy(
-                params[offset:offset + param_size].reshape(state_dict[key].shape)
-            ).float().to(self.device)
-            offset += param_size
-        
-        self.ddpm.model.load_state_dict(state_dict)
+        # Load parameters into model using vectorized utilities (CORRECT: preserves order)
+        params_tensor = torch.from_numpy(params).float().to(self.device)
+        vector_to_parameters(params_tensor, self.ddpm.model.parameters())
         
         # Compute loss WITHOUT backpropagation (ES is gradient-free!)
         self.ddpm.model.eval()
@@ -711,7 +713,10 @@ class ESTrainer:
             x_t = self.ddpm.q_sample(x_batch, t, noise)
             
             # Predict noise
-            noise_pred = self.ddpm.model(x_t, t, y_batch)
+            if self.ddpm.conditional:
+                noise_pred = self.ddpm.model(x_t, t, self.ddpm.t_scale, y_batch)
+            else:
+                noise_pred = self.ddpm.model(x_t, t, self.ddpm.t_scale)
             
             # Check for NaN in prediction
             if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
@@ -727,27 +732,30 @@ class ESTrainer:
     
     def train_step(self, x_batch: torch.Tensor, y_batch: torch.Tensor) -> float:
         """Single ES training step. Returns actual loss (not negative fitness)."""
-        # Get current parameters
-        params = []
-        for param in self.ddpm.model.parameters():
-            params.append(param.data.cpu().numpy().flatten())
-        params = np.concatenate(params)
+        # Get current parameters using vectorized utilities (CORRECT: preserves order)
+        base_params = parameters_to_vector(self.ddpm.model.parameters()).detach()
         
-        # Generate population
-        population = []
-        noises = []
-        for _ in range(self.population_size):
-            noise = np.random.randn(len(params)) * self.sigma
-            noises.append(noise)
-            population.append(params + noise)
+        # Generate population with antithetic sampling (variance reduction)
+        half_pop = max(1, self.population_size // 2)
+        noises = torch.randn(half_pop, base_params.numel(), device=self.device)
+        noises = torch.cat([noises, -noises], dim=0)  # Antithetic pairs
+        noises = noises[:self.population_size]  # Trim if odd
         
         # Evaluate fitness for each population member
         fitnesses = []
         losses = []
-        for p in population:
-            fitness = self.compute_fitness(p, x_batch, y_batch)
+        for i in range(noises.shape[0]):
+            # Set parameters
+            vec = base_params + self.sigma * noises[i]
+            vector_to_parameters(vec, self.ddpm.model.parameters())
+            
+            # Compute fitness
+            fitness = self.compute_fitness(vec.cpu().numpy(), x_batch, y_batch)
             fitnesses.append(fitness)
             losses.append(-fitness)  # Convert back to actual loss
+        
+        # Restore base parameters
+        vector_to_parameters(base_params, self.ddpm.model.parameters())
         
         fitnesses = np.array(fitnesses)
         
@@ -767,37 +775,29 @@ class ESTrainer:
             # No variance in fitness - skip update
             return float(np.mean(losses))
         
-        normalized_fitnesses = (fitnesses - np.mean(fitnesses)) / (fitness_std + 1e-8)
-        grad = np.zeros_like(params)
-        for i in range(self.population_size):
-            grad += normalized_fitnesses[i] * noises[i]
-        grad /= (self.population_size * self.sigma)
+        # Normalize fitnesses
+        fit_tensor = torch.tensor(fitnesses, device=self.device)
+        fit_tensor = (fit_tensor - fit_tensor.mean()) / (fit_tensor.std() + 1e-8)
+        
+        # Compute gradient estimate
+        grad = (fit_tensor.view(-1, 1) * noises).mean(dim=0) / (self.sigma + 1e-12)
         
         # Gradient clipping to prevent divergence
-        grad_norm = np.linalg.norm(grad)
+        grad_norm = torch.norm(grad)
         max_grad_norm = 1.0  # Prevent huge updates
         if grad_norm > max_grad_norm:
             grad = grad * (max_grad_norm / grad_norm)
         
         # Apply update
-        params = params + self.lr * grad
+        new_params = base_params + self.lr * grad
         
         # Check for NaN/Inf in updated params
-        if not np.all(np.isfinite(params)):
+        if not torch.all(torch.isfinite(new_params)):
             # Revert to original params
             return float(np.mean(losses))
         
         # Load updated parameters back to model
-        state_dict = self.ddpm.model.state_dict()
-        offset = 0
-        for key in state_dict.keys():
-            param_size = state_dict[key].numel()
-            state_dict[key] = torch.from_numpy(
-                params[offset:offset + param_size].reshape(state_dict[key].shape)
-            ).float().to(self.device)
-            offset += param_size
-        
-        self.ddpm.model.load_state_dict(state_dict)
+        vector_to_parameters(new_params, self.ddpm.model.parameters())
         self.ddpm.model.train()  # Ensure model is in train mode
         
         # Return actual loss (positive value)
@@ -861,14 +861,20 @@ class MLEWithAnchorTrainer:
         
         # 1. Reconstruction Loss (The "Reward" / Conditional Entropy)
         # Minimizing this approximates minimizing -log p(x|y)
-        noise_pred_current = self.cond_model.model(x_t, t, y_batch)
+        if self.cond_model.conditional:
+            noise_pred_current = self.cond_model.model(x_t, t, self.cond_model.t_scale, y_batch)
+        else:
+            noise_pred_current = self.cond_model.model(x_t, t, self.cond_model.t_scale)
         reconstruction_loss = nn.functional.mse_loss(noise_pred_current, noise)
         
         # 2. Marginal Constraint (KL Divergence Penalty)
         # As per Eq. 11, this is the MSE between the conditional model
         # and the frozen unconditional anchor
         with torch.no_grad():
-            noise_pred_anchor = self.pretrain_model.model(x_t, t, None)
+            if self.pretrain_model.conditional:
+                noise_pred_anchor = self.pretrain_model.model(x_t, t, self.pretrain_model.t_scale, None)
+            else:
+                noise_pred_anchor = self.pretrain_model.model(x_t, t, self.pretrain_model.t_scale)
             
         divergence_from_anchor = nn.functional.mse_loss(noise_pred_current, noise_pred_anchor)
         
@@ -947,7 +953,10 @@ class DDMECPPOTrainer:
             t = torch.randint(0, self.scorer.timesteps, (B,), device=self.device)
             noise = torch.randn_like(y_target)
             y_t = self.scorer.q_sample(y_target, t, noise)
-            eps_pred = self.scorer.model(y_t, t, x_condition)
+            if self.scorer.conditional:
+                eps_pred = self.scorer.model(y_t, t, self.scorer.t_scale, x_condition)
+            else:
+                eps_pred = self.scorer.model(y_t, t, self.scorer.t_scale)
             mse = ((eps_pred - noise) ** 2).mean(dim=-1)  # per-sample
             total += (-mse)
 
@@ -970,7 +979,10 @@ class DDMECPPOTrainer:
 
         for t_int in reversed(range(self.actor.timesteps)):
             t = torch.full((B,), t_int, device=self.device, dtype=torch.long)
-            eps = self.actor.model(x, t, y_cond)
+            if self.actor.conditional:
+                eps = self.actor.model(x, t, self.actor.t_scale, y_cond)
+            else:
+                eps = self.actor.model(x, t, self.actor.t_scale)
 
             mean, std = self.actor.p_mean_std(x, t, eps)
 
@@ -1020,7 +1032,10 @@ class DDMECPPOTrainer:
         # 3) PPO epochs
         self.actor.model.train()
         for _ in range(self.ppo_epochs):
-            eps_new = self.actor.model(X_t, T_t, y_cond.repeat(self.actor.timesteps, 1))
+            if self.actor.conditional:
+                eps_new = self.actor.model(X_t, T_t, self.actor.t_scale, y_cond.repeat(self.actor.timesteps, 1))
+            else:
+                eps_new = self.actor.model(X_t, T_t, self.actor.t_scale)
             mean_new, std_new = self.actor.p_mean_std(X_t, T_t, eps_new)
             new_lp = _normal_logprob(X_prev, mean_new, std_new)
 
@@ -1030,7 +1045,10 @@ class DDMECPPOTrainer:
 
             # anchor constraint (properly scaled KL between Gaussians)
             with torch.no_grad():
-                eps_anchor = self.anchor.model(X_t, T_t, None)
+                if self.anchor.conditional:
+                    eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale, None)
+                else:
+                    eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale)
                 mean_anchor, std_anchor = self.anchor.p_mean_std(X_t, T_t, eps_anchor)
 
             diff = mean_new - mean_anchor
@@ -1351,11 +1369,11 @@ class AblationRunner:
         smart_load_weights(cond_x2, ddpm_x2)
         print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2")
         
-        # Generate training data - UNPAIRED MARGINALS (for fair comparison with PPO)
-        # Note: ES still uses supervised denoising loss, but on unpaired data like PPO
-        # This makes the comparison fairer (both methods see same data distribution)
+        # Generate training data - PAIRED (required for ES with supervised loss)
+        # ES uses supervised denoising loss which requires paired data to learn coupling
+        # PPO uses unpaired marginals with specular reward (different objective)
         x1_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 2.0
-        x2_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 10.0  # UNPAIRED (not x1 + 8)
+        x2_data = x1_data + 8.0  # PAIRED (ES baseline)
         
         dataset = TensorDataset(x1_data, x2_data)
         dataloader = DataLoader(dataset, batch_size=self.config.coupling_batch_size, shuffle=True)
@@ -1379,13 +1397,19 @@ class AblationRunner:
                 t = torch.randint(0, cond_x1.timesteps, (batch_size,), device=self.config.device)
                 noise = torch.randn_like(x1_batch)
                 x1_t = cond_x1.q_sample(x1_batch, t, noise)
-                noise_pred1 = cond_x1.model(x1_t, t, x2_batch)
+                if cond_x1.conditional:
+                    noise_pred1 = cond_x1.model(x1_t, t, cond_x1.t_scale, x2_batch)
+                else:
+                    noise_pred1 = cond_x1.model(x1_t, t, cond_x1.t_scale)
                 loss1 = nn.functional.mse_loss(noise_pred1, noise).item()
                 
                 t = torch.randint(0, cond_x2.timesteps, (batch_size,), device=self.config.device)
                 noise = torch.randn_like(x2_batch)
                 x2_t = cond_x2.q_sample(x2_batch, t, noise)
-                noise_pred2 = cond_x2.model(x2_t, t, x1_batch)
+                if cond_x2.conditional:
+                    noise_pred2 = cond_x2.model(x2_t, t, cond_x2.t_scale, x1_batch)
+                else:
+                    noise_pred2 = cond_x2.model(x2_t, t, cond_x2.t_scale)
                 loss2 = nn.functional.mse_loss(noise_pred2, noise).item()
                 
                 initial_loss += (loss1 + loss2) / 2
