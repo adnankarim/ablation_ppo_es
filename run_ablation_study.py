@@ -44,11 +44,22 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
-import seaborn as sns
 
-# Set style
-plt.style.use('seaborn-v0_8-whitegrid')
-sns.set_palette("husl")
+# Optional seaborn (not critical for functionality)
+try:
+    import seaborn as sns
+    sns.set_palette("husl")
+except Exception:
+    sns = None
+
+# Set style (fallback if seaborn style unavailable)
+try:
+    plt.style.use('seaborn-v0_8-whitegrid')
+except Exception:
+    try:
+        plt.style.use('seaborn-whitegrid')
+    except Exception:
+        pass  # Use default matplotlib style
 
 try:
     import wandb
@@ -615,6 +626,10 @@ class MultiDimDDPM:
             
             # Use same p_mean_std() as PPO (unified kernel)
             mean, std = self.p_mean_std(x, t, eps)
+            
+            # Robustness check: if model blew up, return zeros
+            if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
+                return torch.zeros(num_samples, self.dim, device=self.device)
             
             if t_int > 0:
                 x = mean + std * torch.randn_like(x)
@@ -1420,13 +1435,15 @@ class AblationRunner:
                         w_t = pre_w[:, dim:]
                         
                         # Create weights for the condition (middle part)
+                        # Use pre_w.device to avoid device mismatch (pre_w might be on CPU if loaded with map_location)
+                        dev = pre_w.device
                         if random_cond_init:
                             # Small random weights for PPO bootstrapping (breaks symmetry)
-                            w_cond = cond_scale * torch.randn(pre_w.shape[0], dim, device=self.config.device)
+                            w_cond = cond_scale * torch.randn(pre_w.shape[0], dim, device=dev)
                             print(f"    [SMART LOAD] Spliced random weights (scale={cond_scale}) for conditioning input in {key}")
                         else:
                             # Zero weights for ES warmup (model ignores condition initially)
-                            w_cond = torch.zeros(pre_w.shape[0], dim, device=self.config.device)
+                            w_cond = torch.zeros(pre_w.shape[0], dim, device=dev)
                             print(f"    [SMART LOAD] Spliced zero weights for conditioning input in {key}")
                         
                         # Concatenate [x, cond, t]
@@ -1483,8 +1500,10 @@ class AblationRunner:
         print(f"    Evaluating initial state (before warmup)...")
         initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
         
-        # Compute actual initial loss (before any training)
-        initial_loss = 0.0
+        # Compute initial batch loss (before any training)
+        # Note: This is computed on a single batch, not full epoch (for speed)
+        # Warmup/epoch losses are full-epoch means, so this is just for reference
+        initial_batch_loss = 0.0
         with torch.no_grad():
             for x1_batch, x2_batch in dataloader:
                 x1_batch = x1_batch.to(self.config.device)
@@ -1510,11 +1529,11 @@ class AblationRunner:
                     noise_pred2 = cond_x2.model(x2_t, t, cond_x2.t_scale)
                 loss2 = nn.functional.mse_loss(noise_pred2, noise).item()
                 
-                initial_loss += (loss1 + loss2) / 2
+                initial_batch_loss += (loss1 + loss2) / 2
                 break  # Just compute on first batch for speed
         
         initial_metrics['epoch'] = 0  # Start counting from epoch 0
-        initial_metrics['loss'] = initial_loss
+        initial_metrics['loss'] = initial_batch_loss
         initial_metrics['sigma'] = sigma
         initial_metrics['lr'] = lr
         initial_metrics['phase'] = 'initial'
@@ -1607,8 +1626,9 @@ class AblationRunner:
             metrics['phase'] = 'es'
             epoch_metrics.append(metrics)
             
-            # Generate checkpoint plot
-            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', dim, f'σ={sigma}, lr={lr}')
+            # Generate checkpoint plot (only every plot_every epochs to reduce IO)
+            if (epoch + 1) % self.config.plot_every == 0 or (epoch + 1) == self.config.coupling_epochs:
+                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', dim, f'σ={sigma}, lr={lr}')
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -1681,13 +1701,15 @@ class AblationRunner:
                         w_t = pre_w[:, dim:]
                         
                         # Create weights for the condition (middle part)
+                        # Use pre_w.device to avoid device mismatch (pre_w might be on CPU if loaded with map_location)
+                        dev = pre_w.device
                         if random_cond_init:
                             # Small random weights for PPO bootstrapping (breaks symmetry)
-                            w_cond = cond_scale * torch.randn(pre_w.shape[0], dim, device=self.config.device)
+                            w_cond = cond_scale * torch.randn(pre_w.shape[0], dim, device=dev)
                             print(f"    [SMART LOAD] Spliced random weights (scale={cond_scale}) for conditioning input in {key}")
                         else:
                             # Zero weights for ES warmup (model ignores condition initially)
-                            w_cond = torch.zeros(pre_w.shape[0], dim, device=self.config.device)
+                            w_cond = torch.zeros(pre_w.shape[0], dim, device=dev)
                             print(f"    [SMART LOAD] Spliced zero weights for conditioning input in {key}")
                         
                         # Concatenate [x, cond, t]
@@ -1816,8 +1838,9 @@ class AblationRunner:
             metrics['phase'] = 'ppo'
             epoch_metrics.append(metrics)
             
-            # Generate checkpoint plot
-            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
+            # Generate checkpoint plot (only every plot_every epochs to reduce IO)
+            if (epoch + 1) % self.config.plot_every == 0 or (epoch + 1) == self.config.coupling_epochs:
+                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -1984,7 +2007,8 @@ class AblationRunner:
         if len(all_metrics) < 2:
             return  # Not enough data yet
         
-        # Save metrics to CSV
+        # Save metrics to CSV only on plot checkpoints (reduces IO)
+        # CSV is rewritten each time, but only when we actually plot
         self._save_metrics_to_csv(all_metrics, checkpoint_dir, method, dim)
         
         epochs = [m['epoch'] for m in all_metrics]
@@ -2458,27 +2482,45 @@ Learned vs Target:
         ax8.set_title(f'PPO: KL Heatmap ({dim}D, best over clip)')
         plt.colorbar(im, ax=ax8)
         
-        # Best configs comparison
-        ax9 = fig.add_subplot(gs[2, 2])
+        # Check which methods exist
         has_es = len(results['ES']) > 0
         has_ppo = len(results['PPO']) > 0
         
         best_es = min(results['ES'], key=self._score_config) if has_es else None
         best_ppo = min(results['PPO'], key=self._score_config) if has_ppo else None
         
+        # Helper to safely get values from potentially None best configs
+        def safe_get(best, key, default=0.0):
+            """Safely get value from best config, returning default if None."""
+            return float(best.get(key, default)) if best is not None else float(default)
+        
+        # Guard ES-only plots
+        if not has_es:
+            ax1.set_title(f'ES skipped ({dim}D)')
+            ax1.axis('off')
+            ax2.set_title(f'ES skipped ({dim}D)')
+            ax2.axis('off')
+            ax3.set_title(f'ES skipped ({dim}D)')
+            ax3.axis('off')
+            ax7.set_title(f'ES skipped ({dim}D)')
+            ax7.axis('off')
+        
+        # Guard PPO-only plots
+        if not has_ppo:
+            ax4.set_title(f'PPO skipped ({dim}D)')
+            ax4.axis('off')
+            ax5.set_title(f'PPO skipped ({dim}D)')
+            ax5.axis('off')
+            ax6.set_title(f'PPO skipped ({dim}D)')
+            ax6.axis('off')
+            ax8.set_title(f'PPO skipped ({dim}D)')
+            ax8.axis('off')
+        
+        # Best configs comparison
+        ax9 = fig.add_subplot(gs[2, 2])
         metrics = ['kl_div_total', 'correlation', 'mae', 'mutual_information']
-        if has_es and has_ppo:
-            es_vals = [best_es[m] for m in metrics]
-            ppo_vals = [best_ppo[m] for m in metrics]
-        elif has_es:
-            es_vals = [best_es[m] for m in metrics]
-            ppo_vals = [0.0] * len(metrics)  # Placeholder
-        elif has_ppo:
-            es_vals = [0.0] * len(metrics)  # Placeholder
-            ppo_vals = [best_ppo[m] for m in metrics]
-        else:
-            es_vals = [0.0] * len(metrics)
-            ppo_vals = [0.0] * len(metrics)
+        es_vals = [safe_get(best_es, m, default=0.0) for m in metrics]
+        ppo_vals = [safe_get(best_ppo, m, default=0.0) for m in metrics]
         
         x = np.arange(len(metrics))
         width = 0.35
@@ -2495,8 +2537,8 @@ Learned vs Target:
         # Entropy metrics comparison
         ax10 = fig.add_subplot(gs[2, 3])
         entropy_metrics = ['entropy_x1', 'entropy_x2', 'joint_entropy']
-        es_entropy = [best_es[m] for m in entropy_metrics]
-        ppo_entropy = [best_ppo[m] for m in entropy_metrics]
+        es_entropy = [safe_get(best_es, m, default=0.0) for m in entropy_metrics]
+        ppo_entropy = [safe_get(best_ppo, m, default=0.0) for m in entropy_metrics]
         x = np.arange(len(entropy_metrics))
         ax10.bar(x - width/2, es_entropy, width, label='Best ES')
         ax10.bar(x + width/2, ppo_entropy, width, label='Best PPO')
@@ -2510,8 +2552,8 @@ Learned vs Target:
         # Conditional entropy comparison
         ax11 = fig.add_subplot(gs[3, 0])
         cond_entropy_metrics = ['h_x1_given_x2', 'h_x2_given_x1']
-        es_cond_entropy = [best_es[m] for m in cond_entropy_metrics]
-        ppo_cond_entropy = [best_ppo[m] for m in cond_entropy_metrics]
+        es_cond_entropy = [safe_get(best_es, m, default=0.0) for m in cond_entropy_metrics]
+        ppo_cond_entropy = [safe_get(best_ppo, m, default=0.0) for m in cond_entropy_metrics]
         x = np.arange(len(cond_entropy_metrics))
         ax11.bar(x - width/2, es_cond_entropy, width, label='Best ES')
         ax11.bar(x + width/2, ppo_cond_entropy, width, label='Best PPO')
@@ -2525,8 +2567,8 @@ Learned vs Target:
         # Directional MI comparison
         ax12 = fig.add_subplot(gs[3, 1])
         mi_metrics = ['mi_x2_to_x1', 'mi_x1_to_x2']
-        es_mi = [best_es[m] for m in mi_metrics]
-        ppo_mi = [best_ppo[m] for m in mi_metrics]
+        es_mi = [safe_get(best_es, m, default=0.0) for m in mi_metrics]
+        ppo_mi = [safe_get(best_ppo, m, default=0.0) for m in mi_metrics]
         x = np.arange(len(mi_metrics))
         ax12.bar(x - width/2, es_mi, width, label='Best ES')
         ax12.bar(x + width/2, ppo_mi, width, label='Best PPO')
@@ -2540,8 +2582,8 @@ Learned vs Target:
         # Directional MAE comparison
         ax13 = fig.add_subplot(gs[3, 2])
         mae_metrics = ['mae_x2_to_x1', 'mae_x1_to_x2']
-        es_mae_dir = [best_es[m] for m in mae_metrics]
-        ppo_mae_dir = [best_ppo[m] for m in mae_metrics]
+        es_mae_dir = [safe_get(best_es, m, default=0.0) for m in mae_metrics]
+        ppo_mae_dir = [safe_get(best_ppo, m, default=0.0) for m in mae_metrics]
         x = np.arange(len(mae_metrics))
         ax13.bar(x - width/2, es_mae_dir, width, label='Best ES')
         ax13.bar(x + width/2, ppo_mae_dir, width, label='Best PPO')
@@ -2555,8 +2597,8 @@ Learned vs Target:
         # Individual KL components
         ax14 = fig.add_subplot(gs[3, 3])
         kl_metrics = ['kl_div_1', 'kl_div_2']
-        es_kl_comp = [best_es[m] for m in kl_metrics]
-        ppo_kl_comp = [best_ppo[m] for m in kl_metrics]
+        es_kl_comp = [safe_get(best_es, m, default=0.0) for m in kl_metrics]
+        ppo_kl_comp = [safe_get(best_ppo, m, default=0.0) for m in kl_metrics]
         x = np.arange(len(kl_metrics))
         ax14.bar(x - width/2, es_kl_comp, width, label='Best ES')
         ax14.bar(x + width/2, ppo_kl_comp, width, label='Best PPO')
@@ -2943,10 +2985,13 @@ def main():
     # Output
     parser.add_argument("--output-dir", type=str, default="ablation_results",
                        help="Output directory")
-    parser.add_argument("--use-wandb", action="store_true", default=None,
-                       help="Enable WandB logging (default: from config)")
-    parser.add_argument("--no-wandb", dest="use_wandb", action="store_false",
-                       help="Disable WandB logging")
+    # WandB: mutually exclusive group for clarity
+    wandb_group = parser.add_mutually_exclusive_group()
+    wandb_group.add_argument("--use-wandb", dest="use_wandb", action="store_true",
+                            help="Enable WandB logging")
+    wandb_group.add_argument("--no-wandb", dest="use_wandb", action="store_false",
+                            help="Disable WandB logging")
+    parser.set_defaults(use_wandb=None)  # None means use config default
     parser.add_argument("--wandb-project", type=str, default="ddmec-ablation",
                        help="WandB project name")
     parser.add_argument("--seed", type=int, default=42,
