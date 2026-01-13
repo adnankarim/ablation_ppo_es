@@ -34,6 +34,7 @@ from typing import Dict, List, Tuple, Optional, Any
 from collections import defaultdict
 
 import numpy as np
+import math
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
@@ -349,7 +350,7 @@ class AblationConfig:
     ddpm_epochs: int = 200
     ddpm_lr: float = 1e-3
     ddpm_batch_size: int = 128  # Increased from 64 for 2x speedup
-    ddpm_timesteps: int = 1000
+    ddpm_timesteps: int = 100  # Reduced from 1000 for PPO feasibility
     ddpm_hidden_dim: int = 128
     ddpm_num_samples: int = 50000
     
@@ -618,6 +619,38 @@ class MultiDimDDPM:
         checkpoint = torch.load(path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    
+    @torch.no_grad()
+    def p_mean_std(self, x_t: torch.Tensor, t: torch.Tensor, eps_pred: torch.Tensor):
+        """
+        Reverse kernel p_theta(x_{t-1} | x_t, cond) assumed Gaussian with:
+          mean derived from eps_pred (DDPM)
+          std = sqrt(beta_t)
+        """
+        beta_t = self.betas[t].view(-1, 1)
+        alpha_t = self.alphas[t].view(-1, 1)
+        abar_t = self.alphas_cumprod[t].view(-1, 1)
+
+        # x0 estimate from epsilon prediction
+        x0_hat = (x_t - torch.sqrt(1.0 - abar_t) * eps_pred) / (torch.sqrt(abar_t) + 1e-8)
+        x0_hat = torch.clamp(x0_hat, -50.0, 50.0)
+
+        # posterior mean for p(x_{t-1} | x_t, x0_hat)
+        # using the common DDPM parametrization via epsilon
+        mean = (1.0 / torch.sqrt(alpha_t)) * (x_t - (beta_t / (torch.sqrt(1.0 - abar_t) + 1e-8)) * eps_pred)
+
+        std = torch.sqrt(beta_t).clamp_min(1e-4)
+        return mean, std
+
+
+# ============================================================================
+# HELPER FUNCTIONS FOR PPO
+# ============================================================================
+
+def _normal_logprob(x, mean, std):
+    """Diagonal Gaussian log p(x | mean, std)."""
+    var = std * std
+    return (-0.5 * ((x - mean) ** 2 / (var + 1e-8) + 2.0 * torch.log(std + 1e-8) + math.log(2 * math.pi))).sum(dim=-1)
 
 
 # ============================================================================
@@ -768,16 +801,13 @@ class ESTrainer:
 
 
 # ============================================================================
-# PPO TRAINER
+# MLE WITH ANCHOR TRAINER (Old implementation - kept for reference)
 # ============================================================================
 
-class PPOTrainer:
+class MLEWithAnchorTrainer:
     """
-    PPO trainer for conditional diffusion models implementing DDMEC.
-    
-    Implements Equation 9 and 11 from DDMEC paper:
-    - Reconstruction loss (conditional entropy minimization)
-    - KL divergence penalty (marginal constraint)
+    Old MLE-based trainer (kept for reference/compatibility).
+    This is NOT PPO - it's just MLE denoising loss + anchor MSE constraint.
     """
     
     def __init__(
@@ -805,7 +835,7 @@ class PPOTrainer:
     
     def train_step(self, x_batch: torch.Tensor, y_batch: torch.Tensor) -> float:
         """
-        Single PPO training step implementing DDMEC Equation 9 and 11.
+        Single MLE training step implementing DDMEC Equation 9 and 11.
         
         L = reconstruction_loss + lambda * KL[p_theta || p_theta_*]
         
@@ -848,6 +878,171 @@ class PPOTrainer:
         self.optimizer.step()
         
         return total_loss.item()
+
+
+# ============================================================================
+# REAL PPO TRAINER (DDMEC PPO-style)
+# ============================================================================
+
+class DDMECPPOTrainer:
+    """
+    Real PPO over the reverse diffusion kernel:
+      policy:  p_theta(x_{t-1} | x_t, cond) = N(mean_theta, sigma_t^2 I)
+
+    Reward is provided by the OTHER conditional model (specular scorer),
+    estimated via denoising-MSE-based log-likelihood proxy.
+    """
+
+    def __init__(
+        self,
+        actor: MultiDimDDPM,          # conditional model being updated
+        anchor: MultiDimDDPM,         # frozen unconditional pretrained model (KL constraint)
+        scorer: MultiDimDDPM,         # other conditional model (fixed during this phase)
+        kl_coef: float = 1e-3,
+        clip_eps: float = 0.2,
+        ppo_epochs: int = 4,
+        rollout_steps: int = None,    # if None, use actor.timesteps
+        mc_reward_steps: int = 4,
+        lr: float = 1e-5,
+        device: str = "cuda",
+    ):
+        self.actor = actor
+        self.anchor = anchor
+        self.scorer = scorer
+
+        self.kl_coef = kl_coef
+        self.clip_eps = clip_eps
+        self.ppo_epochs = ppo_epochs
+        self.mc_reward_steps = mc_reward_steps
+        self.device = torch.device(device)
+
+        self.rollout_steps = rollout_steps if rollout_steps is not None else actor.timesteps
+        if self.rollout_steps != actor.timesteps:
+            raise ValueError("For correctness, set rollout_steps == actor.timesteps (no skipping).")
+
+        # freeze anchor always
+        self.anchor.model.eval()
+        for p in self.anchor.model.parameters():
+            p.requires_grad = False
+
+        self.opt = torch.optim.Adam(self.actor.model.parameters(), lr=lr)
+        self.reward_ema = 0.0
+        self.reward_ema_beta = 0.95
+
+    @torch.no_grad()
+    def _estimate_reward(self, y_target: torch.Tensor, x_condition: torch.Tensor) -> torch.Tensor:
+        """
+        Reward ≈ log p_scorer(y_target | x_condition)
+        Proxy via negative denoising MSE on random timesteps (MC average).
+        """
+        self.scorer.model.eval()
+        B = y_target.shape[0]
+        total = torch.zeros(B, device=self.device)
+
+        for _ in range(self.mc_reward_steps):
+            t = torch.randint(0, self.scorer.timesteps, (B,), device=self.device)
+            noise = torch.randn_like(y_target)
+            y_t = self.scorer.q_sample(y_target, t, noise)
+            eps_pred = self.scorer.model(y_t, t, x_condition)
+            mse = ((eps_pred - noise) ** 2).mean(dim=-1)  # per-sample
+            total += (-mse)
+
+        return total / float(self.mc_reward_steps)
+
+    @torch.no_grad()
+    def _collect_rollout(self, y_cond: torch.Tensor):
+        """
+        Rollout the reverse diffusion chain and store transitions:
+          (x_t, t, x_{t-1}, old_logp)
+        """
+        self.actor.model.eval()
+        B = y_cond.shape[0]
+        x = torch.randn(B, self.actor.dim, device=self.device)
+
+        xs_t = []
+        ts = []
+        xs_prev = []
+        old_logps = []
+
+        for t_int in reversed(range(self.actor.timesteps)):
+            t = torch.full((B,), t_int, device=self.device, dtype=torch.long)
+            eps = self.actor.model(x, t, y_cond)
+
+            mean, std = self.actor.p_mean_std(x, t, eps)
+
+            if t_int > 0:
+                z = torch.randn_like(x)
+                x_prev = mean + std * z
+            else:
+                x_prev = mean
+
+            logp = _normal_logprob(x_prev, mean, std)
+
+            xs_t.append(x)
+            ts.append(t)
+            xs_prev.append(x_prev)
+            old_logps.append(logp)
+
+            x = x_prev
+
+        x0 = x
+        return x0, xs_t, ts, xs_prev, old_logps
+
+    def train_step(self, y_cond: torch.Tensor) -> Dict[str, float]:
+        """
+        One DDMEC PPO update for actor using scorer reward.
+        y_cond is REAL sample from the marginal of the conditioning variable.
+        """
+        # 1) rollout using current actor
+        x_gen, xs_t, ts, xs_prev, old_logps = self._collect_rollout(y_cond)
+
+        # 2) reward from fixed scorer: log p_scorer(y_cond | x_gen)
+        with torch.no_grad():
+            reward = self._estimate_reward(y_cond, x_gen)
+
+            # baseline for advantage
+            r_mean = reward.mean().item()
+            self.reward_ema = self.reward_ema_beta * self.reward_ema + (1 - self.reward_ema_beta) * r_mean
+            adv = reward - self.reward_ema
+            adv = (adv - adv.mean()) / (adv.std() + 1e-8)  # normalize
+
+        # stack rollout buffers
+        X_t = torch.cat(xs_t, dim=0)           # [T*B, dim]
+        T_t = torch.cat(ts, dim=0)             # [T*B]
+        X_prev = torch.cat(xs_prev, dim=0)     # [T*B, dim]
+        OLD_LP = torch.cat(old_logps, dim=0)   # [T*B]
+        ADV = adv.repeat(self.actor.timesteps) # [T*B]
+
+        # 3) PPO epochs
+        self.actor.model.train()
+        for _ in range(self.ppo_epochs):
+            eps_new = self.actor.model(X_t, T_t, y_cond.repeat(self.actor.timesteps, 1))
+            mean_new, std_new = self.actor.p_mean_std(X_t, T_t, eps_new)
+            new_lp = _normal_logprob(X_prev, mean_new, std_new)
+
+            ratio = torch.exp(new_lp - OLD_LP)
+            clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
+            ppo_obj = torch.min(ratio * ADV, clipped * ADV).mean()
+
+            # anchor constraint (approx KL via mean difference)
+            with torch.no_grad():
+                eps_anchor = self.anchor.model(X_t, T_t, None)
+                mean_anchor, _ = self.anchor.p_mean_std(X_t, T_t, eps_anchor)
+
+            anchor_pen = ((mean_new - mean_anchor) ** 2).mean()
+
+            loss = -(ppo_obj) + self.kl_coef * anchor_pen
+
+            self.opt.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor.model.parameters(), 1.0)
+            self.opt.step()
+
+        return {
+            "loss": float(loss.item()),
+            "reward_mean": float(reward.mean().item()),
+            "reward_std": float(reward.std().item()),
+        }
 
 
 # ============================================================================
@@ -1387,62 +1582,40 @@ class AblationRunner:
         smart_load_weights(cond_x2, ddpm_x2)
         print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2")
         
-        # Generate training data
+        # Generate training data - UNPAIRED MARGINALS (critical for DDMEC)
         x1_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 2.0
-        x2_data = x1_data + 8.0  # Coupled
+        x2_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 10.0  # UNPAIRED (not x1 + 8)
         
-        dataset = TensorDataset(x1_data, x2_data)
-        dataloader = DataLoader(dataset, batch_size=self.config.coupling_batch_size, shuffle=True)
+        dataset_x1 = TensorDataset(x1_data)
+        dataset_x2 = TensorDataset(x2_data)
+        dataloader_x1 = DataLoader(dataset_x1, batch_size=self.config.coupling_batch_size, shuffle=True)
+        dataloader_x2 = DataLoader(dataset_x2, batch_size=self.config.coupling_batch_size, shuffle=True)
         
-        # Create PPO trainers with STATIC ANCHOR MODELS (per DDMEC Eq. 11)
-        # Pass pretrained unconditional models as anchors
-        ppo_x1 = PPOTrainer(cond_x1, ddpm_x1, kl_weight, ppo_clip, lr, self.config.device)
-        ppo_x2 = PPOTrainer(cond_x2, ddpm_x2, kl_weight, ppo_clip, lr, self.config.device)
+        # Create REAL PPO trainers with specular scoring
+        # actor=cond_x1, scorer=cond_x2 (fixed during phase A)
+        # actor=cond_x2, scorer=cond_x1 (fixed during phase B)
+        ppo_x1 = DDMECPPOTrainer(
+            actor=cond_x1, anchor=ddpm_x1, scorer=cond_x2,
+            kl_coef=kl_weight, clip_eps=ppo_clip, lr=lr,
+            ppo_epochs=4, rollout_steps=self.config.ddpm_timesteps,
+            device=self.config.device
+        )
+        ppo_x2 = DDMECPPOTrainer(
+            actor=cond_x2, anchor=ddpm_x2, scorer=cond_x1,
+            kl_coef=kl_weight, clip_eps=ppo_clip, lr=lr,
+            ppo_epochs=4, rollout_steps=self.config.ddpm_timesteps,
+            device=self.config.device
+        )
         
         # Training loop
         epoch_metrics = []
         
         # Evaluate INITIAL state (epoch 0)
-        # Initial MI ~0.3-0.4 is expected (from pretrained model capability)
-        # Important: MI should INCREASE significantly during training (0.3 → 2.0+)
         print(f"    Evaluating initial state (before PPO training)...")
         initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
         
-        # Compute actual initial loss (before any training)
-        initial_loss = 0.0
-        with torch.no_grad():
-            for x1_batch, x2_batch in dataloader:
-                x1_batch = x1_batch.to(self.config.device)
-                x2_batch = x2_batch.to(self.config.device)
-                
-                # Compute loss for both directions (with KL penalty)
-                batch_size = x1_batch.shape[0]
-                
-                # Direction 1: P(X1|X2)
-                t = torch.randint(0, cond_x1.timesteps, (batch_size,), device=self.config.device)
-                noise = torch.randn_like(x1_batch)
-                x1_t = cond_x1.q_sample(x1_batch, t, noise)
-                noise_pred1 = cond_x1.model(x1_t, t, x2_batch)
-                recon_loss1 = nn.functional.mse_loss(noise_pred1, noise)
-                noise_pred_anchor1 = ddpm_x1.model(x1_t, t, None)
-                kl_loss1 = nn.functional.mse_loss(noise_pred1, noise_pred_anchor1)
-                loss1 = (recon_loss1 + kl_weight * kl_loss1).item()
-                
-                # Direction 2: P(X2|X1)
-                t = torch.randint(0, cond_x2.timesteps, (batch_size,), device=self.config.device)
-                noise = torch.randn_like(x2_batch)
-                x2_t = cond_x2.q_sample(x2_batch, t, noise)
-                noise_pred2 = cond_x2.model(x2_t, t, x1_batch)
-                recon_loss2 = nn.functional.mse_loss(noise_pred2, noise)
-                noise_pred_anchor2 = ddpm_x2.model(x2_t, t, None)
-                kl_loss2 = nn.functional.mse_loss(noise_pred2, noise_pred_anchor2)
-                loss2 = (recon_loss2 + kl_weight * kl_loss2).item()
-                
-                initial_loss += (loss1 + loss2) / 2
-                break  # Just compute on first batch for speed
-        
         initial_metrics['epoch'] = 0
-        initial_metrics['loss'] = initial_loss
+        initial_metrics['loss'] = 0.0  # Will be computed from reward
         initial_metrics['kl_weight'] = kl_weight
         initial_metrics['ppo_clip'] = ppo_clip
         initial_metrics['lr'] = lr
@@ -1462,29 +1635,55 @@ class AblationRunner:
                 f'PPO/{dim}D/config_{config_idx}/initial/mae': initial_metrics['mae'],
             })
         
-        # ===== COOPERATIVE TRAINING LOOP (Algorithm 1 from DDMEC) =====
-        # The two models cooperate: while one is fixed, the other is updated
+        # ===== REAL PPO COOPERATIVE TRAINING LOOP (Specular Alternation) =====
         for epoch in range(self.config.coupling_epochs):
-            epoch_losses = []
+            epoch_logs = []
             
-            for x1_batch, x2_batch in dataloader:
-                x1_batch = x1_batch.to(self.config.device)
-                x2_batch = x2_batch.to(self.config.device)
+            # Create iterators for both dataloaders
+            iter_x1 = iter(dataloader_x1)
+            iter_x2 = iter(dataloader_x2)
+            
+            # Process batches together
+            num_batches = len(dataloader_x1)
+            for batch_idx in range(num_batches):
+                try:
+                    x1_batch = next(iter_x1)[0].to(self.config.device)
+                except StopIteration:
+                    iter_x1 = iter(dataloader_x1)
+                    x1_batch = next(iter_x1)[0].to(self.config.device)
                 
-                # ===== Phase A: Train P(X1|X2) with φ as fixed anchor =====
-                # Update θ using φ as the reference (specular) model
-                loss1 = ppo_x1.train_step(x1_batch, x2_batch)
+                try:
+                    x2_batch = next(iter_x2)[0].to(self.config.device)
+                except StopIteration:
+                    iter_x2 = iter(dataloader_x2)
+                    x2_batch = next(iter_x2)[0].to(self.config.device)
                 
-                # ===== Phase B: Train P(X2|X1) with θ as fixed anchor =====
-                # Update φ using θ as the reference (specular) model
-                loss2 = ppo_x2.train_step(x2_batch, x1_batch)
+                # -------------------------
+                # Phase A: update theta = P(X1|X2), scorer = phi fixed
+                # -------------------------
+                for p in cond_x2.model.parameters():
+                    p.requires_grad = False
+                for p in cond_x1.model.parameters():
+                    p.requires_grad = True
                 
-                epoch_losses.append((loss1 + loss2) / 2)
+                log_a = ppo_x1.train_step(y_cond=x2_batch)
+                
+                # -------------------------
+                # Phase B: update phi = P(X2|X1), scorer = theta fixed
+                # -------------------------
+                for p in cond_x1.model.parameters():
+                    p.requires_grad = False
+                for p in cond_x2.model.parameters():
+                    p.requires_grad = True
+                
+                log_b = ppo_x2.train_step(y_cond=x1_batch)
+                
+                epoch_logs.append(0.5 * (log_a["reward_mean"] + log_b["reward_mean"]))
             
             # Evaluate coupling quality after both phases
             metrics = self._evaluate_coupling(dim, cond_x1, cond_x2)
             metrics['epoch'] = epoch + 1  # Epochs: 1, 2, 3... (epoch 0 is initial)
-            metrics['loss'] = np.mean(epoch_losses)
+            metrics['loss'] = float(-np.mean(epoch_logs))  # Higher reward => lower "loss" for plotting
             metrics['kl_weight'] = kl_weight
             metrics['ppo_clip'] = ppo_clip
             metrics['lr'] = lr
