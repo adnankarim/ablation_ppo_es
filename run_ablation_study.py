@@ -259,17 +259,6 @@ class InformationMetrics:
         h_x1 = InformationMetrics.entropy_multidim_gaussian(np.diag(std1_learned ** 2))
         h_x2 = InformationMetrics.entropy_multidim_gaussian(np.diag(std2_learned ** 2))
         
-        # Joint Entropy - FIXED: Use generated samples to measure learned coupling
-        h_joint_gen = InformationMetrics.joint_entropy_from_samples(x1_gen, x2_gen)
-        
-        # Mutual Information I(X1_gen; X2_gen) - measures how well model learned coupling
-        # Should start near 0 (independent) and increase with training
-        mutual_info = max(0, h_x1 + h_x2 - h_joint_gen)
-        
-        # Clamp MI to reasonable range (per dimension): [0, 6*dim] 
-        # For independent: MI ≈ 0, for fully dependent: MI ≈ H(X)
-        mutual_info = min(mutual_info, 6.0 * dim)
-        
         # Joint entropies for conditional quality (true -> generated)
         h_joint_21 = InformationMetrics.joint_entropy_from_samples(x2_true, x1_gen)
         h_joint_12 = InformationMetrics.joint_entropy_from_samples(x1_true, x2_gen)
@@ -286,6 +275,19 @@ class InformationMetrics:
         
         mi_21 = max(0, h_x2_true + h_x1 - h_joint_21)  # I(X2_true; X1_gen)
         mi_12 = max(0, h_x1_true + h_x2 - h_joint_12)  # I(X1_true; X2_gen)
+        
+        # Mutual Information - symmetric true->generated MI (consistent with conditional entropy terms)
+        # This measures how well the conditional models learned the coupling
+        mutual_info = 0.5 * (mi_21 + mi_12)
+        
+        # Clamp MI to reasonable range (per dimension): [0, 6*dim] 
+        # For independent: MI ≈ 0, for fully dependent: MI ≈ H(X)
+        mutual_info = float(np.clip(mutual_info, 0.0, 6.0 * dim))
+        
+        # Also compute gen->gen MI for reference (optional, kept for backward compatibility)
+        h_joint_gen = InformationMetrics.joint_entropy_from_samples(x1_gen, x2_gen)
+        mi_gen_gen = max(0, h_x1 + h_x2 - h_joint_gen)
+        mi_gen_gen = float(np.clip(mi_gen_gen, 0.0, 6.0 * dim))
         
         # Conditional Entropy H(X|Y) = H(X,Y) - H(Y)
         h_x1_given_x2 = max(0, h_joint_21 - h_x2_true)
@@ -318,6 +320,7 @@ class InformationMetrics:
             'entropy_x2': float(h_x2),
             'joint_entropy': float(h_joint),
             'mutual_information': float(mutual_info),
+            'mi_gen_gen': float(mi_gen_gen),  # Generated->generated MI (for reference)
             'mi_x2_to_x1': float(mi_21),
             'mi_x1_to_x2': float(mi_12),
             'h_x1_given_x2': float(h_x1_given_x2),
@@ -359,6 +362,7 @@ class AblationConfig:
     coupling_batch_size: int = 128  # Increased from 64 for 2x speedup
     coupling_num_samples: int = 30000
     warmup_epochs: int = 15  # Increased for stability in high dimensions
+    warmup_lr: float = 1e-4  # Fixed LR for warmup (separate from ES/PPO ablation LR)
     num_sampling_steps: int = 100
     
     # ES Ablations (population size FIXED at 30)
@@ -1024,14 +1028,15 @@ class DDMECPPOTrainer:
             clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
             ppo_obj = torch.min(ratio * ADV, clipped * ADV).mean()
 
-            # anchor constraint (approx KL via mean difference)
+            # anchor constraint (properly scaled KL between Gaussians)
             with torch.no_grad():
                 eps_anchor = self.anchor.model(X_t, T_t, None)
-                mean_anchor, _ = self.anchor.p_mean_std(X_t, T_t, eps_anchor)
+                mean_anchor, std_anchor = self.anchor.p_mean_std(X_t, T_t, eps_anchor)
 
-            anchor_pen = ((mean_new - mean_anchor) ** 2).mean()
+            diff = mean_new - mean_anchor
+            anchor_kl = 0.5 * ((diff / (std_anchor + 1e-8)) ** 2).mean()
 
-            loss = -(ppo_obj) + self.kl_coef * anchor_pen
+            loss = -(ppo_obj) + self.kl_coef * anchor_kl
 
             self.opt.zero_grad()
             loss.backward()
@@ -1321,11 +1326,12 @@ class AblationRunner:
         # ----------------------------
         
         # Create conditional models and initialize from pretrained unconditional models
+        # Use fixed warmup_lr for warmup phase (separate from ES lr being ablated)
         cond_x1 = MultiDimDDPM(
             dim=dim,
             timesteps=self.config.ddpm_timesteps,
             hidden_dim=self.config.ddpm_hidden_dim,
-            lr=lr,
+            lr=self.config.warmup_lr,  # Fixed warmup LR (not the ablated ES LR)
             device=self.config.device,
             conditional=True
         )
@@ -1337,7 +1343,7 @@ class AblationRunner:
             dim=dim,
             timesteps=self.config.ddpm_timesteps,
             hidden_dim=self.config.ddpm_hidden_dim,
-            lr=lr,
+            lr=self.config.warmup_lr,  # Fixed warmup LR (not the ablated ES LR)
             device=self.config.device,
             conditional=True
         )
@@ -1345,9 +1351,11 @@ class AblationRunner:
         smart_load_weights(cond_x2, ddpm_x2)
         print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2")
         
-        # Generate training data
+        # Generate training data - UNPAIRED MARGINALS (for fair comparison with PPO)
+        # Note: ES still uses supervised denoising loss, but on unpaired data like PPO
+        # This makes the comparison fairer (both methods see same data distribution)
         x1_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 2.0
-        x2_data = x1_data + 8.0  # Coupled
+        x2_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 10.0  # UNPAIRED (not x1 + 8)
         
         dataset = TensorDataset(x1_data, x2_data)
         dataloader = DataLoader(dataset, batch_size=self.config.coupling_batch_size, shuffle=True)
