@@ -80,7 +80,7 @@ class InformationMetrics:
     def entropy_multidim_gaussian(cov_matrix: np.ndarray) -> float:
         """Entropy of multivariate Gaussian: H(X) = 0.5 * ln((2πe)^d * det(Σ))
         
-        Returns entroppopuly normalized per dimension for fair comparison.
+        Returns total entropy (not normalized per dimension).
         """
         cov_matrix = np.atleast_2d(cov_matrix)
         d = cov_matrix.shape[0]
@@ -1598,12 +1598,17 @@ class AblationRunner:
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         # --- SMART LOADING HELPER (Same as ES) ---
-        def smart_load_weights(target_model, source_model):
+        def smart_load_weights(target_model, source_model, random_cond_init=False, cond_scale=1e-3):
             """
             Smart weight loading that handles input layer shape mismatch.
             
             Problem: Unconditional model has input [x, t], conditional has [x, cond, t]
-            Solution: Splice ZERO weights for conditioning input to ignore it initially
+            Solution: Splice weights for conditioning input
+            
+            Args:
+                random_cond_init: If True, use small random weights (for PPO bootstrapping)
+                                 If False, use zeros (for ES warmup)
+                cond_scale: Scale for random initialization (default 1e-3)
             """
             pretrained_state = source_model.model.state_dict()
             current_state = target_model.model.state_dict()
@@ -1622,14 +1627,19 @@ class AblationRunner:
                         w_x = pre_w[:, :dim]
                         w_t = pre_w[:, dim:]
                         
-                        # Create ZERO weights for the condition (middle part)
-                        # This ensures the model initially ignores the condition
-                        w_cond = torch.zeros(pre_w.shape[0], dim, device=self.config.device)
+                        # Create weights for the condition (middle part)
+                        if random_cond_init:
+                            # Small random weights for PPO bootstrapping (breaks symmetry)
+                            w_cond = cond_scale * torch.randn(pre_w.shape[0], dim, device=self.config.device)
+                            print(f"    [SMART LOAD] Spliced random weights (scale={cond_scale}) for conditioning input in {key}")
+                        else:
+                            # Zero weights for ES warmup (model ignores condition initially)
+                            w_cond = torch.zeros(pre_w.shape[0], dim, device=self.config.device)
+                            print(f"    [SMART LOAD] Spliced zero weights for conditioning input in {key}")
                         
                         # Concatenate [x, cond, t]
                         new_w = torch.cat([w_x, w_cond, w_t], dim=1)
                         current_state[key] = new_w
-                        print(f"    [SMART LOAD] Spliced zero weights for conditioning input in {key}")
             
             target_model.model.load_state_dict(current_state)
         # ----------------------------
@@ -1813,6 +1823,7 @@ class AblationRunner:
                     'mutual_information': 0.0,
                     'mi_x2_to_x1': 0.0,
                     'mi_x1_to_x2': 0.0,
+                    'mi_gen_gen': 0.0,
                     'h_x1_given_x2': 0.0,
                     'h_x2_given_x1': 0.0,
                     'h_theoretical': dim * 1.42,
@@ -1851,6 +1862,7 @@ class AblationRunner:
                 'mutual_information': 0.0,
                 'mi_x2_to_x1': 0.0,
                 'mi_x1_to_x2': 0.0,
+                'mi_gen_gen': 0.0,
                 'h_x1_given_x2': 0.0,
                 'h_x2_given_x1': 0.0,
                 'h_theoretical': dim * 1.42,
@@ -2098,14 +2110,16 @@ Learned vs Target:
                  verticalalignment='center', transform=ax15.transAxes,
                  bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.3))
         
-        plt.suptitle(f'{method} Training Checkpoint - Epoch {epoch} ({dim}D) [Dashed Line = Warmup|Training]', fontsize=16, fontweight='bold')
+        # Use actual epoch number from metrics (includes warmup epochs)
+        actual_epoch = latest['epoch']
+        plt.suptitle(f'{method} Training Checkpoint - Epoch {actual_epoch} ({dim}D) [Dashed Line = Warmup|Training]', fontsize=16, fontweight='bold')
         plt.tight_layout()
         
-        # Generate filename based on actual epoch number
-        if epoch < 0:
-            plot_filename = f'warmup_{abs(epoch):02d}.png'
+        # Generate filename based on actual epoch number from metrics
+        if actual_epoch < 0:
+            plot_filename = f'warmup_{abs(actual_epoch):02d}.png'
         else:
-            plot_filename = f'epoch_{epoch:03d}.png'
+            plot_filename = f'epoch_{actual_epoch:03d}.png'
         
         plot_path = os.path.join(checkpoint_dir, plot_filename)
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
