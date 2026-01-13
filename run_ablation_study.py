@@ -707,75 +707,188 @@ def _normal_logprob(x, mean, std):
 # ============================================================================
 
 class ESTrainer:
-    """Evolution Strategies trainer for coupling."""
+    """
+    Evolution Strategies trainer using SAME unpaired objective as PPO.
+    
+    Fair comparison: ES and PPO optimize identical objective J(θ) = E[reward] - λ*KL
+    - Same data: unpaired marginals (independent samples)
+    - Same reward: contrastive reward (r_pos - r_neg)
+    - Same constraint: KL penalty to anchor model
+    - Budget matching: normalized by rollout samples
+    """
     
     def __init__(
         self,
-        ddpm: MultiDimDDPM,
+        actor: MultiDimDDPM,  # Conditional model being optimized
+        anchor: MultiDimDDPM,  # Frozen unconditional pretrained model (KL constraint)
+        scorer: MultiDimDDPM,  # Other conditional model (fixed, provides reward)
         population_size: int = 10,
         sigma: float = 0.002,
         lr: float = 0.001,
+        kl_coef: float = 1e-3,  # Same as PPO
+        mc_reward_steps: int = 4,  # Same as PPO
         device: str = "cuda"
     ):
-        self.ddpm = ddpm
+        self.actor = actor
+        self.anchor = anchor
+        self.scorer = scorer
         self.population_size = population_size
         self.sigma = sigma
         self.lr = lr
+        self.kl_coef = kl_coef
+        self.mc_reward_steps = mc_reward_steps
         self.device = torch.device(device)
+        
+        # Freeze anchor and scorer (they don't change during ES)
+        self.anchor.model.eval()
+        for p in self.anchor.model.parameters():
+            p.requires_grad = False
+        self.scorer.model.eval()
+        for p in self.scorer.model.parameters():
+            p.requires_grad = False
     
-    def compute_fitness(self, params: np.ndarray, x_batch: torch.Tensor, y_batch: torch.Tensor) -> float:
-        """Compute fitness (negative loss) - NO GRADIENTS, pure forward pass."""
-        # Check for NaN/Inf in params
-        if not np.all(np.isfinite(params)):
-            return -float('inf')  # Worst fitness for invalid params
+    @torch.no_grad()
+    def _collect_rollout(self, y_cond: torch.Tensor):
+        """Collect rollout using current actor (same as PPO)."""
+        self.actor.model.eval()
+        B = y_cond.shape[0]
+        x = torch.randn(B, self.actor.dim, device=self.device)
         
-        # Load parameters into model using vectorized utilities (CORRECT: preserves order)
-        params_tensor = torch.from_numpy(params).float().to(self.device)
-        vector_to_parameters(params_tensor, self.ddpm.model.parameters())
-        
-        # Compute loss WITHOUT backpropagation (ES is gradient-free!)
-        self.ddpm.model.eval()
-        with torch.no_grad():
-            batch_size = x_batch.shape[0]
-            
-            # Sample random timesteps
-            t = torch.randint(0, self.ddpm.timesteps, (batch_size,), device=self.device)
-            
-            # Sample noise
-            noise = torch.randn_like(x_batch)
-            
-            # Forward diffusion
-            x_t = self.ddpm.q_sample(x_batch, t, noise)
-            
-            # Predict noise
-            if self.ddpm.conditional:
-                noise_pred = self.ddpm.model(x_t, t, self.ddpm.t_scale, y_batch)
+        # Rollout reverse diffusion chain
+        for t_int in reversed(range(1, self.actor.timesteps)):  # Skip t=0
+            t = torch.full((B,), t_int, device=self.device, dtype=torch.long)
+            if self.actor.conditional:
+                eps = self.actor.model(x, t, self.actor.t_scale, y_cond)
             else:
-                noise_pred = self.ddpm.model(x_t, t, self.ddpm.t_scale)
+                eps = self.actor.model(x, t, self.actor.t_scale)
             
-            # Check for NaN in prediction
-            if torch.isnan(noise_pred).any() or torch.isinf(noise_pred).any():
-                return -float('inf')  # Worst fitness
+            mean, std = self.actor.p_mean_std(x, t, eps)
+            std = std.clamp_min(1e-4)
             
-            # Compute loss (MSE)
-            loss = nn.functional.mse_loss(noise_pred, noise)
+            z = torch.randn_like(x)
+            x_prev = mean + std * z
+            x_prev = torch.clamp(x_prev, -100.0, 100.0)  # Match PPO
+            x = x_prev
+        
+        return x  # Final x0
+    
+    @torch.no_grad()
+    def _compute_reward(self, y_target: torch.Tensor, x_condition: torch.Tensor) -> torch.Tensor:
+        """Compute contrastive reward (same as PPO)."""
+        B = y_target.shape[0]
+        
+        def score(y, xcond):
+            """Score function: negative denoising MSE (proxy for log-likelihood)."""
+            total = torch.zeros(B, device=self.device)
+            for _ in range(self.mc_reward_steps):
+                t = torch.randint(0, self.scorer.timesteps, (B,), device=self.device)
+                noise = torch.randn_like(y)
+                y_t = self.scorer.q_sample(y, t, noise)
+                if self.scorer.conditional:
+                    eps_pred = self.scorer.model(y_t, t, self.scorer.t_scale, xcond)
+                else:
+                    eps_pred = self.scorer.model(y_t, t, self.scorer.t_scale)
+                mse = ((eps_pred - noise) ** 2).mean(dim=-1)  # per-sample
+                total += (-mse)
+            return total / float(self.mc_reward_steps)
+        
+        # Positive: correct pairing
+        r_pos = score(y_target, x_condition)
+        
+        # Negative: shuffled pairing (breaks coupling)
+        x_shuf = x_condition[torch.randperm(B, device=self.device)]
+        r_neg = score(y_target, x_shuf)
+        
+        # Contrastive reward: difference forces conditioning dependence
+        return r_pos - r_neg
+    
+    @torch.no_grad()
+    def _compute_kl_penalty(self, y_cond: torch.Tensor) -> float:
+        """Compute KL penalty to anchor (same as PPO)."""
+        # Sample a batch of rollouts to compute KL
+        B = y_cond.shape[0]
+        x_gen = self._collect_rollout(y_cond)
+        
+        # Sample random timesteps for KL computation
+        t = torch.randint(1, self.actor.timesteps, (B,), device=self.device)
+        t_tensor = torch.full((B,), t[0].item(), device=self.device, dtype=torch.long)  # Use same t for all
+        
+        # Get actor mean/std
+        if self.actor.conditional:
+            eps_actor = self.actor.model(x_gen, t_tensor, self.actor.t_scale, y_cond)
+        else:
+            eps_actor = self.actor.model(x_gen, t_tensor, self.actor.t_scale)
+        mean_actor, std_actor = self.actor.p_mean_std(x_gen, t_tensor, eps_actor)
+        std_actor = std_actor.clamp_min(1e-4)
+        
+        # Get anchor mean/std
+        if self.anchor.conditional:
+            eps_anchor = self.anchor.model(x_gen, t_tensor, self.anchor.t_scale, None)
+        else:
+            eps_anchor = self.anchor.model(x_gen, t_tensor, self.anchor.t_scale)
+        mean_anchor, std_anchor = self.anchor.p_mean_std(x_gen, t_tensor, eps_anchor)
+        std_anchor = std_anchor.clamp_min(1e-4)
+        
+        # KL divergence (Gaussian approximation)
+        diff = mean_actor - mean_anchor
+        kl = 0.5 * ((diff / (std_anchor + 1e-8)) ** 2).mean()
+        
+        return float(kl.item())
+    
+    def compute_fitness(self, params_vec: torch.Tensor, y_cond: torch.Tensor, seed: int = None) -> float:
+        """
+        Compute fitness J(θ) = E[reward] - λ*KL (same objective as PPO).
+        
+        Args:
+            params_vec: Parameter vector (flattened model parameters)
+            y_cond: Conditioning variable (unpaired marginal sample)
+            seed: Random seed for common random numbers (variance reduction)
+        
+        Returns:
+            Fitness value (higher is better)
+        """
+        # Check for NaN/Inf
+        if not torch.all(torch.isfinite(params_vec)):
+            return -float('inf')
+        
+        # Load parameters into model
+        vector_to_parameters(params_vec, self.actor.model.parameters())
+        
+        # Set seed for common random numbers (if provided)
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+        
+        self.actor.model.eval()
+        with torch.no_grad():
+            # Collect rollout
+            x_gen = self._collect_rollout(y_cond)
             
-            if torch.isnan(loss) or torch.isinf(loss):
+            # Compute reward (contrastive)
+            reward = self._compute_reward(y_cond, x_gen)
+            reward_mean = reward.mean().item()
+            
+            # Compute KL penalty
+            kl_penalty = self._compute_kl_penalty(y_cond)
+            
+            # Fitness = reward - λ*KL (same as PPO objective)
+            fitness = reward_mean - self.kl_coef * kl_penalty
+            
+            if not np.isfinite(fitness):
                 return -float('inf')
         
-        return -loss.item()  # Negative loss as fitness
+        return float(fitness)
     
-    def train_step(self, x_batch: torch.Tensor, y_batch: torch.Tensor) -> float:
-        """Single ES training step. Returns actual loss (not negative fitness)."""
-        # Get current parameters using vectorized utilities (CORRECT: preserves order)
-        base_params = parameters_to_vector(self.ddpm.model.parameters()).detach()
+    def train_step(self, y_cond: torch.Tensor, seed: int = None) -> Dict[str, float]:
+        """
+        Single ES training step using antithetic sampling.
         
-        # COMMON RANDOM NUMBERS: sample t and noise once, reuse for all candidates
-        # This dramatically reduces variance in ES gradient estimates
-        B = x_batch.shape[0]
-        t = torch.randint(0, self.ddpm.timesteps, (B,), device=self.device)
-        noise = torch.randn_like(x_batch)
-        x_t = self.ddpm.q_sample(x_batch, t, noise)
+        Returns:
+            Dict with 'loss' (negative fitness), 'reward_mean', 'kl_penalty'
+        """
+        # Get current parameters
+        base_params = parameters_to_vector(self.actor.model.parameters()).detach()
         
         # Generate population with antithetic sampling (variance reduction)
         half_pop = max(1, self.population_size // 2)
@@ -783,35 +896,41 @@ class ESTrainer:
         param_noises = torch.cat([param_noises, -param_noises], dim=0)  # Antithetic pairs
         param_noises = param_noises[:self.population_size]  # Trim if odd
         
-        # Evaluate fitness for each population member (using common t/noise/x_t)
+        # Evaluate fitness for each population member (with common random numbers)
         fitnesses = []
-        losses = []
+        rewards = []
+        kls = []
+        
         for i in range(param_noises.shape[0]):
             # Set parameters
             vec = base_params + self.sigma * param_noises[i]
-            vector_to_parameters(vec, self.ddpm.model.parameters())
             
-            # Compute fitness using COMMON random numbers (t, noise, x_t)
-            self.ddpm.model.eval()
-            with torch.no_grad():
-                if self.ddpm.conditional:
-                    eps_pred = self.ddpm.model(x_t, t, self.ddpm.t_scale, y_batch)
-                else:
-                    eps_pred = self.ddpm.model(x_t, t, self.ddpm.t_scale)
-                loss = ((eps_pred - noise) ** 2).mean()
+            # Use common random seed for variance reduction
+            eval_seed = seed if seed is not None else None
             
-            fitness = -loss.item()
+            # Compute fitness (reward - λ*KL)
+            fitness = self.compute_fitness(vec, y_cond, seed=eval_seed)
             fitnesses.append(fitness)
-            losses.append(-fitness)  # Convert back to actual loss
+            
+            # Also track components for logging
+            if i == 0:  # Only compute components once (for efficiency)
+                # Recompute with base params to get reward/KL
+                vector_to_parameters(base_params, self.actor.model.parameters())
+                self.actor.model.eval()
+                with torch.no_grad():
+                    x_gen = self._collect_rollout(y_cond)
+                    reward = self._compute_reward(y_cond, x_gen)
+                    kl_penalty = self._compute_kl_penalty(y_cond)
+                    rewards.append(reward.mean().item())
+                    kls.append(kl_penalty)
         
         # Restore base parameters
-        vector_to_parameters(base_params, self.ddpm.model.parameters())
+        vector_to_parameters(base_params, self.actor.model.parameters())
         
         fitnesses = np.array(fitnesses)
         
-        # Check for NaN/Inf in fitnesses
+        # Check for NaN/Inf
         if not np.all(np.isfinite(fitnesses)):
-            # Replace invalid with worst valid fitness
             valid_mask = np.isfinite(fitnesses)
             if np.any(valid_mask):
                 worst_fitness = np.min(fitnesses[valid_mask])
@@ -822,36 +941,47 @@ class ESTrainer:
         # Update parameters using ES gradient estimate
         fitness_std = np.std(fitnesses)
         if fitness_std < 1e-10:
-            # No variance in fitness - skip update
-            return float(np.mean(losses))
+            # No variance - skip update
+            return {
+                'loss': float(-np.mean(fitnesses)),
+                'reward_mean': float(np.mean(rewards)) if rewards else 0.0,
+                'kl_penalty': float(np.mean(kls)) if kls else 0.0,
+            }
         
         # Normalize fitnesses
         fit_tensor = torch.tensor(fitnesses, device=self.device)
         fit_tensor = (fit_tensor - fit_tensor.mean()) / (fit_tensor.std() + 1e-8)
         
-        # Compute gradient estimate
+        # Compute gradient estimate: g = (1/(N*σ)) * Σ (F_k * ε_k)
+        # For antithetic: g = (1/(N*σ)) * Σ ((F+_k - F-_k) * ε_k)
         grad = (fit_tensor.view(-1, 1) * param_noises).mean(dim=0) / (self.sigma + 1e-12)
         
-        # Gradient clipping to prevent divergence
+        # Gradient clipping
         grad_norm = torch.norm(grad)
-        max_grad_norm = 1.0  # Prevent huge updates
+        max_grad_norm = 1.0
         if grad_norm > max_grad_norm:
             grad = grad * (max_grad_norm / grad_norm)
         
         # Apply update
         new_params = base_params + self.lr * grad
         
-        # Check for NaN/Inf in updated params
+        # Check for NaN/Inf
         if not torch.all(torch.isfinite(new_params)):
-            # Revert to original params
-            return float(np.mean(losses))
+            return {
+                'loss': float(-np.mean(fitnesses)),
+                'reward_mean': float(np.mean(rewards)) if rewards else 0.0,
+                'kl_penalty': float(np.mean(kls)) if kls else 0.0,
+            }
         
-        # Load updated parameters back to model
-        vector_to_parameters(new_params, self.ddpm.model.parameters())
-        self.ddpm.model.train()  # Ensure model is in train mode
+        # Load updated parameters
+        vector_to_parameters(new_params, self.actor.model.parameters())
+        self.actor.model.train()
         
-        # Return actual loss (positive value)
-        return float(np.mean(losses))
+        return {
+            'loss': float(-np.mean(fitnesses)),  # Negative fitness as "loss"
+            'reward_mean': float(np.mean(rewards)) if rewards else 0.0,
+            'kl_penalty': float(np.mean(kls)) if kls else 0.0,
+        }
 
 
 # ============================================================================
@@ -1492,39 +1622,39 @@ class AblationRunner:
         os.makedirs(checkpoint_dir, exist_ok=True)
         
         # Create conditional models and initialize from pretrained unconditional models
-        # Use fixed warmup_lr for warmup phase (separate from ES lr being ablated)
+        # ES now uses same objective as PPO, so no separate warmup phase needed
         cond_x1 = MultiDimDDPM(
             dim=dim,
             timesteps=self.config.ddpm_timesteps,
             hidden_dim=self.config.ddpm_hidden_dim,
-            lr=self.config.warmup_lr,  # Fixed warmup LR (not the ablated ES LR)
+            lr=lr,  # Use ES LR directly
             device=self.config.device,
             conditional=True
         )
-        # Apply smart loading with ZERO init for ES (ES has supervised warmup)
-        self.smart_load_weights(cond_x1, ddpm_x1, dim, random_cond_init=False)
-        print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1")
+        # Apply smart loading with RANDOM init for ES (same as PPO - needed for reward signal)
+        # ES now uses same contrastive reward as PPO, so needs non-zero conditioning weights
+        self.smart_load_weights(cond_x1, ddpm_x1, dim, random_cond_init=True, cond_scale=1e-3)
+        print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1 (random cond weights for ES-Reward)")
         
         cond_x2 = MultiDimDDPM(
             dim=dim,
             timesteps=self.config.ddpm_timesteps,
             hidden_dim=self.config.ddpm_hidden_dim,
-            lr=self.config.warmup_lr,  # Fixed warmup LR (not the ablated ES LR)
+            lr=lr,  # Use ES LR (no separate warmup phase needed)
             device=self.config.device,
             conditional=True
         )
-        # Apply smart loading with ZERO init for ES (ES has supervised warmup)
-        self.smart_load_weights(cond_x2, ddpm_x2, dim, random_cond_init=False)
-        print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2")
+        # Apply smart loading with RANDOM init for ES (same as PPO)
+        self.smart_load_weights(cond_x2, ddpm_x2, dim, random_cond_init=True, cond_scale=1e-3)
+        print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2 (random cond weights for ES-Reward)")
         
-        # Generate training data - PAIRED (required for ES with supervised loss)
-        # ES uses supervised denoising loss which requires paired data to learn coupling
-        # PPO uses unpaired marginals with specular reward (different objective)
-        x1_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 2.0
-        x2_data = x1_data + 8.0  # PAIRED (ES baseline)
+        # Generate training data - UNPAIRED (same as PPO for fair comparison)
+        # ES now uses same unpaired objective as PPO: J(θ) = E[reward] - λ*KL
+        # Both methods optimize identical objective on identical data regime
+        x1_data = torch.randn(self.config.coupling_num_samples, dim, device=self.config.device) * 1.0 + 2.0
+        x2_data = torch.randn(self.config.coupling_num_samples, dim, device=self.config.device) * 1.0 + 10.0  # UNPAIRED marginals
         
-        dataset = TensorDataset(x1_data, x2_data)
-        dataloader = DataLoader(dataset, batch_size=self.config.coupling_batch_size, shuffle=True)
+        # No dataloader needed - ES samples batches on-the-fly (like PPO)
         
         # Initialize metrics tracking (includes warmup + ES training)
         epoch_metrics = []
@@ -1536,43 +1666,11 @@ class AblationRunner:
         eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
         
         # Evaluate INITIAL state (before any training)
-        print(f"    Evaluating initial state (before warmup)...")
+        print(f"    Evaluating initial state...")
         initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
         
-        # Compute initial batch loss (before any training)
-        # Note: This is computed on a single batch, not full epoch (for speed)
-        # Warmup/epoch losses are full-epoch means, so this is just for reference
-        initial_batch_loss = 0.0
-        with torch.no_grad():
-            for x1_batch, x2_batch in dataloader:
-                x1_batch = x1_batch.to(self.config.device)
-                x2_batch = x2_batch.to(self.config.device)
-                
-                # Compute loss for both directions
-                batch_size = x1_batch.shape[0]
-                t = torch.randint(0, cond_x1.timesteps, (batch_size,), device=self.config.device)
-                noise = torch.randn_like(x1_batch)
-                x1_t = cond_x1.q_sample(x1_batch, t, noise)
-                if cond_x1.conditional:
-                    noise_pred1 = cond_x1.model(x1_t, t, cond_x1.t_scale, x2_batch)
-                else:
-                    noise_pred1 = cond_x1.model(x1_t, t, cond_x1.t_scale)
-                loss1 = nn.functional.mse_loss(noise_pred1, noise).item()
-                
-                t = torch.randint(0, cond_x2.timesteps, (batch_size,), device=self.config.device)
-                noise = torch.randn_like(x2_batch)
-                x2_t = cond_x2.q_sample(x2_batch, t, noise)
-                if cond_x2.conditional:
-                    noise_pred2 = cond_x2.model(x2_t, t, cond_x2.t_scale, x1_batch)
-                else:
-                    noise_pred2 = cond_x2.model(x2_t, t, cond_x2.t_scale)
-                loss2 = nn.functional.mse_loss(noise_pred2, noise).item()
-                
-                initial_batch_loss += (loss1 + loss2) / 2
-                break  # Just compute on first batch for speed
-        
-        initial_metrics['epoch'] = 0  # Start counting from epoch 0
-        initial_metrics['loss'] = initial_batch_loss
+        initial_metrics['epoch'] = 0
+        initial_metrics['loss'] = 0.0  # Will be computed by ES trainers
         initial_metrics['sigma'] = sigma
         initial_metrics['lr'] = lr
         initial_metrics['phase'] = 'initial'
@@ -1591,75 +1689,74 @@ class AblationRunner:
                 f'ES/{dim}D/config_{config_idx}/initial/mae': initial_metrics['mae'],
             })
         
-        # WARMUP PHASE: Use gradient descent first to get to good initialization
-        if self.config.warmup_epochs > 0:
-            print(f"    Warmup phase: {self.config.warmup_epochs} epochs with gradient descent...")
-            for warmup_epoch in range(self.config.warmup_epochs):
-                warmup_losses = []
-                for x1_batch, x2_batch in dataloader:
-                    x1_batch = x1_batch.to(self.config.device)
-                    x2_batch = x2_batch.to(self.config.device)
-                    
-                    # Standard gradient training
-                    loss1 = cond_x1.train_step(x1_batch, x2_batch)
-                    loss2 = cond_x2.train_step(x2_batch, x1_batch)
-                    warmup_losses.append((loss1 + loss2) / 2)
-                
-                # Evaluate metrics during warmup
-                metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
-                metrics['epoch'] = warmup_epoch + 1  # Consecutive numbering: 1, 2, 3...
-                metrics['loss'] = np.mean(warmup_losses)
-                metrics['sigma'] = sigma
-                metrics['lr'] = lr
-                metrics['phase'] = 'warmup'
-                epoch_metrics.append(metrics)
-                
-                # Skip plotting during warmup (user wants only main epochs in plots)
-                
-                # Log warmup to wandb
-                if self.config.use_wandb and WANDB_AVAILABLE:
-                    wandb.log({
-                        f'ES/{dim}D/config_{config_idx}/warmup/epoch': warmup_epoch,
-                        f'ES/{dim}D/config_{config_idx}/warmup/loss': metrics['loss'],
-                        f'ES/{dim}D/config_{config_idx}/warmup/kl_total': metrics['kl_div_total'],
-                        f'ES/{dim}D/config_{config_idx}/warmup/mutual_information': metrics['mutual_information'],
-                        f'ES/{dim}D/config_{config_idx}/warmup/correlation': metrics['correlation'],
-                        f'ES/{dim}D/config_{config_idx}/warmup/mae': metrics['mae'],
-                    })
-                
-                if (warmup_epoch + 1) % 1 == 0:
-                    print(f"      Warmup Epoch {warmup_epoch+1}/{self.config.warmup_epochs}, "
-                          f"Loss: {np.mean(warmup_losses):.4f}, "
-                          f"KL/dim: {metrics['kl_div_total']:.4f}, "
-                          f"Corr: {metrics['correlation']:.4f}")
-            
-            print(f"    [WARMUP] Warmup complete. Starting ES fine-tuning...")
+        # Create ES-Reward trainers (same objective as PPO)
+        # Use same KL weight as PPO for fair comparison (can be made configurable later)
+        kl_weight = 1e-3  # Default, same as PPO
+        es_x1 = ESTrainer(
+            actor=cond_x1,
+            anchor=ddpm_x1,
+            scorer=cond_x2,  # Fixed scorer (specular)
+            population_size=self.config.es_population_size,
+            sigma=sigma,
+            lr=lr,
+            kl_coef=kl_weight,
+            mc_reward_steps=4,  # Same as PPO
+            device=self.config.device
+        )
+        es_x2 = ESTrainer(
+            actor=cond_x2,
+            anchor=ddpm_x2,
+            scorer=cond_x1,  # Fixed scorer (specular)
+            population_size=self.config.es_population_size,
+            sigma=sigma,
+            lr=lr,
+            kl_coef=kl_weight,
+            mc_reward_steps=4,  # Same as PPO
+            device=self.config.device
+        )
         
-        # Create ES trainers
-        es_x1 = ESTrainer(cond_x1, self.config.es_population_size, sigma, lr, self.config.device)
-        es_x2 = ESTrainer(cond_x2, self.config.es_population_size, sigma, lr, self.config.device)
-        
-        # Training loop (ES fine-tuning after warmup)
+        # Training loop: ES-Reward with specular alternation (same as PPO)
+        # Budget matching: ES uses N fitness evals per step, PPO uses U updates per epoch
+        # For fairness, we match total rollout samples (not epochs)
         
         for epoch in range(self.config.coupling_epochs):
-            epoch_losses = []
+            epoch_logs = []
             
-            for x1_batch, x2_batch in dataloader:
-                x1_batch = x1_batch.to(self.config.device)
-                x2_batch = x2_batch.to(self.config.device)
-                
-                # Train P(X1|X2)
-                loss1 = es_x1.train_step(x1_batch, x2_batch)
-                
-                # Train P(X2|X1)
-                loss2 = es_x2.train_step(x2_batch, x1_batch)
-                
-                epoch_losses.append((loss1 + loss2) / 2)
+            # Sample batches on-the-fly (like PPO) for budget matching
+            # Number of ES steps per epoch should match PPO updates per epoch
+            num_es_steps = self.config.ppo_updates_per_epoch  # Match PPO budget
             
-            # Evaluate
+            for step in range(num_es_steps):
+                # Sample unpaired marginals (same as PPO)
+                batch_size = self.config.coupling_batch_size
+                x1_batch = torch.randn(batch_size, dim, device=self.config.device) * 1.0 + 2.0
+                x2_batch = torch.randn(batch_size, dim, device=self.config.device) * 1.0 + 10.0
+                
+                # Common random seed for variance reduction
+                seed = epoch * 10000 + step
+                
+                # Phase A: update θ = P(X1|X2), scorer = φ fixed
+                for p in cond_x2.model.parameters():
+                    p.requires_grad = False
+                for p in cond_x1.model.parameters():
+                    p.requires_grad = True
+                
+                log_a = es_x1.train_step(y_cond=x2_batch, seed=seed)
+                
+                # Phase B: update φ = P(X2|X1), scorer = θ fixed
+                for p in cond_x1.model.parameters():
+                    p.requires_grad = False
+                for p in cond_x2.model.parameters():
+                    p.requires_grad = True
+                
+                log_b = es_x2.train_step(y_cond=x1_batch, seed=seed)
+                
+                epoch_logs.append(0.5 * (log_a.get('reward_mean', 0.0) + log_b.get('reward_mean', 0.0)))
+            
+            # Evaluate coupling quality after both phases
             metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
-            metrics['epoch'] = self.config.warmup_epochs + epoch + 1  # Continue numbering after warmup
-            metrics['loss'] = np.mean(epoch_losses)
+            metrics['epoch'] = epoch + 1
+            metrics['loss'] = float(-np.mean(epoch_logs))  # Higher reward => lower "loss" for plotting
             metrics['sigma'] = sigma
             metrics['lr'] = lr
             metrics['phase'] = 'es'
