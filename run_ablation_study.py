@@ -260,9 +260,11 @@ class InformationMetrics:
         
         # KL Divergences (per-dimension for fair comparison across dims)
         # NOTE: This measures marginal distribution quality P(X) vs target
-        # For PPO/DDMEC, this KL should INCREASE as model learns coupling!
-        # Why? Conditional P(X|Y) learns to use Y, so generated marginal P(X) 
-        # may differ from unconditional pretrained marginal as coupling emerges.
+        # For synthetic Gaussian marginals with correct coupling (X2 ≈ X1 + 8),
+        # KL should generally stay LOW or decrease as model learns coupling correctly.
+        # KL may increase if: conditional model distorts marginal variance, sampling
+        # instability dominates, or reward pushes "shortcut" solutions.
+        # Use KL as a sanity check, not an expectation of increase.
         kl_1 = InformationMetrics.kl_divergence_gaussian(mu1_learned, std1_learned, mu1_target, std_target, per_dimension=True)
         kl_2 = InformationMetrics.kl_divergence_gaussian(mu2_learned, std2_learned, mu2_target, std_target, per_dimension=True)
         
@@ -1053,6 +1055,8 @@ class DDMECPPOTrainer:
 
             z = torch.randn_like(x)
             x_prev = mean + std * z
+            # Clamp rollout states to prevent explosion (matches sample() behavior)
+            x_prev = torch.clamp(x_prev, -100.0, 100.0)
 
             logp = _normal_logprob(x_prev, mean, std)
 
@@ -1095,12 +1099,26 @@ class DDMECPPOTrainer:
         OLD_LP = torch.cat(old_logps, dim=0)   # [T*B]
         ADV = adv.repeat(num_transitions)      # [T*B] - repeat for each transition
 
+        # Cache anchor stats once (they depend only on X_t, T_t which don't change during PPO epochs)
+        # This saves repeated anchor forward passes (significant speedup)
+        with torch.no_grad():
+            if self.anchor.conditional:
+                eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale, None)
+            else:
+                eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale)
+            mean_anchor, std_anchor = self.anchor.p_mean_std(X_t, T_t, eps_anchor)
+            std_anchor = std_anchor.clamp_min(1e-4)  # For safety
+
+        # Detach and prepare conditioning for PPO epochs (constant across epochs)
+        if self.actor.conditional:
+            cond_rep = y_cond.detach().repeat(num_transitions, 1)
+        else:
+            cond_rep = None
+
         # 3) PPO epochs
         self.actor.model.train()
         for _ in range(self.ppo_epochs):
             if self.actor.conditional:
-                # Detach and make contiguous for safety
-                cond_rep = y_cond.detach().repeat(num_transitions, 1)
                 eps_new = self.actor.model(X_t, T_t, self.actor.t_scale, cond_rep)
             else:
                 eps_new = self.actor.model(X_t, T_t, self.actor.t_scale)
@@ -1114,15 +1132,7 @@ class DDMECPPOTrainer:
             clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
             ppo_obj = torch.min(ratio * ADV, clipped * ADV).mean()
 
-            # anchor constraint (properly scaled KL between Gaussians)
-            with torch.no_grad():
-                if self.anchor.conditional:
-                    eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale, None)
-                else:
-                    eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale)
-                mean_anchor, std_anchor = self.anchor.p_mean_std(X_t, T_t, eps_anchor)
-                std_anchor = std_anchor.clamp_min(1e-4)  # For safety
-
+            # anchor constraint (uses cached anchor stats)
             diff = mean_new - mean_anchor
             anchor_kl = 0.5 * ((diff / (std_anchor + 1e-8)) ** 2).mean()
 
@@ -1190,6 +1200,65 @@ class AblationRunner:
         print(f"Reuse pretrained models: {config.reuse_pretrained}")
         print(f"WandB: {'Enabled' if config.use_wandb and WANDB_AVAILABLE else 'Disabled'}")
     
+    def smart_load_weights(self, cond_ddpm: MultiDimDDPM, base_ddpm: MultiDimDDPM, dim: int,
+                          random_cond_init: bool = False, cond_scale: float = 1e-3):
+        """
+        Initialize ConditionalMultiDimMLP from MultiDimMLP:
+          - time_embed copied exactly
+          - net layers copied where shapes match
+          - first net layer: copy x + time parts, init condition part (zeros or small random)
+        
+        Args:
+            cond_ddpm: Conditional model to load weights into
+            base_ddpm: Unconditional pretrained model to load from
+            dim: Dimension of the data
+            random_cond_init: If True, use small random weights (for PPO bootstrapping)
+                            If False, use zeros (for ES warmup)
+            cond_scale: Scale for random initialization (default 1e-3, use 1e-2 for high dims)
+        """
+        cond_m = cond_ddpm.model
+        base_m = base_ddpm.model
+
+        # 1) Copy time embedding exactly
+        cond_m.time_embed.load_state_dict(base_m.time_embed.state_dict())
+
+        # 2) Copy all shared layers except the first Linear, which has different input width
+        # net: [Linear0, SiLU, Linear1, SiLU, Linear2, SiLU, Linear3]
+        # Only Linear0 differs (input dim)
+        for idx in [2, 4, 6]:  # indices of Linear layers after the first
+            cond_m.net[idx].load_state_dict(base_m.net[idx].state_dict())
+
+        # 3) Handle first Linear weight mapping
+        # base Linear0: in = dim + t_emb
+        # cond Linear0: in = 2*dim + t_emb  (x, condition, t_emb)
+        base_L0 = base_m.net[0]
+        cond_L0 = cond_m.net[0]
+
+        with torch.no_grad():
+            # Zero everything first
+            cond_L0.weight.zero_()
+            cond_L0.bias.copy_(base_L0.bias)
+
+            # base order: [x | t_emb]
+            # cond order: [x | cond | t_emb]
+            t_emb_dim = base_L0.weight.shape[1] - dim
+
+            # Copy x block
+            cond_L0.weight[:, :dim].copy_(base_L0.weight[:, :dim])
+
+            # Copy time-embedding block (base tail) into conditional tail
+            cond_L0.weight[:, 2*dim:2*dim + t_emb_dim].copy_(base_L0.weight[:, dim:dim + t_emb_dim])
+
+            # Init condition block
+            if random_cond_init:
+                # Scale cond_scale with dimension for better signal in high dims
+                effective_scale = cond_scale * (1.0 if dim <= 10 else 1e-1)  # 1e-2 for dim>=20
+                cond_L0.weight[:, dim:2*dim].normal_(mean=0.0, std=effective_scale)
+                print(f"    [SMART LOAD] Spliced random weights (scale={effective_scale:.1e}) for conditioning input")
+            else:
+                cond_L0.weight[:, dim:2*dim].zero_()
+                print(f"    [SMART LOAD] Spliced zero weights for conditioning input")
+    
     def run(self):
         """Run the complete ablation study."""
         print("\n" + "="*80)
@@ -1237,6 +1306,15 @@ class AblationRunner:
                     es_configs = es_configs[:self.config.max_es_configs]
                     print(f"  [LIMIT] Running only first {len(es_configs)} ES configs (--max-es-configs)")
                 
+                # Select single config if es_config_idx is specified (for job arrays)
+                if hasattr(self.config, 'es_config_idx') and self.config.es_config_idx is not None:
+                    if self.config.es_config_idx >= len(es_configs):
+                        print(f"  [ERROR] --es-config-idx {self.config.es_config_idx} >= {len(es_configs)} configs. Skipping ES.")
+                        dim_results['ES'] = []
+                    else:
+                        es_configs = [es_configs[self.config.es_config_idx]]
+                        print(f"  [SELECT] Running only ES config {self.config.es_config_idx}: {es_configs[0]}")
+                
                 for i, (sigma, lr) in enumerate(es_configs):
                     print(f"\n  ES Config {i+1}/{len(es_configs)}: sigma={sigma}, lr={lr}")
                     result = self._run_es_experiment(
@@ -1262,6 +1340,15 @@ class AblationRunner:
                 if hasattr(self.config, 'max_ppo_configs') and self.config.max_ppo_configs is not None:
                     ppo_configs = ppo_configs[:self.config.max_ppo_configs]
                     print(f"  [LIMIT] Running only first {len(ppo_configs)} PPO configs (--max-ppo-configs)")
+                
+                # Select single config if ppo_config_idx is specified (for job arrays)
+                if hasattr(self.config, 'ppo_config_idx') and self.config.ppo_config_idx is not None:
+                    if self.config.ppo_config_idx >= len(ppo_configs):
+                        print(f"  [ERROR] --ppo-config-idx {self.config.ppo_config_idx} >= {len(ppo_configs)} configs. Skipping PPO.")
+                        dim_results['PPO'] = []
+                    else:
+                        ppo_configs = [ppo_configs[self.config.ppo_config_idx]]
+                        print(f"  [SELECT] Running only PPO config {self.config.ppo_config_idx}: {ppo_configs[0]}")
                 
                 for i, (kl_weight, ppo_clip, lr) in enumerate(ppo_configs):
                     print(f"\n  PPO Config {i+1}/{len(ppo_configs)}: kl_weight={kl_weight}, clip={ppo_clip}, lr={lr}")
@@ -1443,7 +1530,8 @@ class AblationRunner:
         epoch_metrics = []
         
         # Generate frozen eval set for consistent evaluation across epochs
-        num_eval = 1000
+        # Increase samples for high dims to stabilize MI estimation (30D needs more samples for 60D Gaussian)
+        num_eval = 5000 if dim >= 20 else 1000
         eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
         eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
         
@@ -1667,7 +1755,8 @@ class AblationRunner:
         epoch_metrics = []
         
         # Generate frozen eval set for consistent evaluation across epochs
-        num_eval = 1000
+        # Increase samples for high dims to stabilize MI estimation (30D needs more samples for 60D Gaussian)
+        num_eval = 5000 if dim >= 20 else 1000
         eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
         eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
         
@@ -1789,6 +1878,8 @@ class AblationRunner:
             if x1_true is None or x2_true is None:
                 # Generate test data with slight noise for MI to be finite
                 # Deterministic coupling (x2 = x1 + 8) makes MI infinite; add small noise
+                # Increase samples for high dims to stabilize MI estimation (30D needs more samples for 60D Gaussian)
+                num_eval = 5000 if dim >= 20 else 1000
                 x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
                 x2_true = x1_true + 8.0 + 0.1 * torch.randn_like(x1_true)  # Add noise for finite MI
             
@@ -1844,6 +1935,9 @@ class AblationRunner:
             
             # Add dimension to metrics for scoring normalization
             metrics['dim'] = dim
+            
+            # Add MI per-dimension as first-class metric (useful for high-dim analysis)
+            metrics['mutual_information_per_dim'] = metrics.get('mutual_information', 0.0) / dim if dim > 0 else 0.0
             
             return metrics
             
@@ -2950,6 +3044,10 @@ def main():
                        help="Limit number of ES configs to test (for quick runs)")
     parser.add_argument("--max-ppo-configs", type=int, default=None,
                        help="Limit number of PPO configs to test (for quick runs)")
+    parser.add_argument("--es-config-idx", type=int, default=None,
+                       help="Run only a single ES config by index (for job arrays, overrides --max-es-configs)")
+    parser.add_argument("--ppo-config-idx", type=int, default=None,
+                       help="Run only a single PPO config by index (for job arrays, overrides --max-ppo-configs)")
     
     args = parser.parse_args()
     
@@ -2984,6 +3082,8 @@ def main():
     config.only_method = args.only_method
     config.max_es_configs = args.max_es_configs
     config.max_ppo_configs = args.max_ppo_configs
+    config.es_config_idx = args.es_config_idx
+    config.ppo_config_idx = args.ppo_config_idx
     
     # Run ablation study
     runner = AblationRunner(config)
