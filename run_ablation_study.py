@@ -365,9 +365,10 @@ class AblationConfig:
     warmup_epochs: int = 15  # Increased for stability in high dimensions
     warmup_lr: float = 1e-4  # Fixed LR for warmup (separate from ES/PPO ablation LR)
     num_sampling_steps: int = 100
+    ppo_updates_per_epoch: int = 20  # CRITICAL: Reduce PPO compute cost (was iterating over full dataset)
     
-    # ES Ablations (population size FIXED at 30)
-    es_population_size: int = 15  # FIXED (increased from 15 for better exploration)
+    # ES Ablations (population size fixed)
+    es_population_size: int = 15  # Fixed population size for ES
     es_sigma_values: List[float] = field(default_factory=lambda: [0.001, 0.002, 0.005, 0.01])
     es_lr_values: List[float] = field(default_factory=lambda: [0.0001, 0.0002, 0.0005, 0.001])  # Reduced to prevent divergence
     
@@ -587,8 +588,20 @@ class MultiDimDDPM:
                 condition = condition.repeat(num_samples, 1)
         
         # Reverse diffusion - use same kernel as PPO (DDPM posterior)
-        # IMPORTANT: for PPO correctness, do not skip steps (use all timesteps)
-        for t_int in reversed(range(self.timesteps)):
+        # Note: num_steps can be used for faster evaluation, but PPO training uses full timesteps
+        steps = min(int(num_steps), self.timesteps) if num_steps is not None else self.timesteps
+        
+        # Build explicit timestep indices including endpoints (prevents skipping t=timesteps-1)
+        if steps == self.timesteps:
+            # Full timesteps: use all
+            t_indices = list(reversed(range(self.timesteps)))
+        else:
+            # Reduced steps: use linspace to get evenly spaced indices including endpoints
+            t_indices = np.linspace(self.timesteps - 1, 0, steps).round().astype(int)
+            t_indices = np.unique(t_indices)  # remove duplicates due to rounding
+            t_indices = list(reversed(t_indices))  # reverse to go from high to low
+        
+        for t_int in t_indices:
             t = torch.full((num_samples,), t_int, device=self.device, dtype=torch.long)
             
             # Predict noise
@@ -1049,13 +1062,18 @@ class DDMECPPOTrainer:
         self.actor.model.train()
         for _ in range(self.ppo_epochs):
             if self.actor.conditional:
-                eps_new = self.actor.model(X_t, T_t, self.actor.t_scale, y_cond.repeat(num_transitions, 1))
+                # Detach and make contiguous for safety
+                cond_rep = y_cond.detach().repeat(num_transitions, 1)
+                eps_new = self.actor.model(X_t, T_t, self.actor.t_scale, cond_rep)
             else:
                 eps_new = self.actor.model(X_t, T_t, self.actor.t_scale)
             mean_new, std_new = self.actor.p_mean_std(X_t, T_t, eps_new)
+            std_new = std_new.clamp_min(1e-4)  # CRITICAL: match rollout clamp
             new_lp = _normal_logprob(X_prev, mean_new, std_new)
 
-            ratio = torch.exp(new_lp - OLD_LP)
+            # Clamp log-prob difference to prevent ratio explosion
+            delta = (new_lp - OLD_LP).clamp(-20, 20)
+            ratio = torch.exp(delta)
             clipped = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps)
             ppo_obj = torch.min(ratio * ADV, clipped * ADV).mean()
 
@@ -1066,6 +1084,7 @@ class DDMECPPOTrainer:
                 else:
                     eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale)
                 mean_anchor, std_anchor = self.anchor.p_mean_std(X_t, T_t, eps_anchor)
+                std_anchor = std_anchor.clamp_min(1e-4)  # For safety
 
             diff = mean_new - mean_anchor
             anchor_kl = 0.5 * ((diff / (std_anchor + 1e-8)) ** 2).mean()
@@ -1322,13 +1341,18 @@ class AblationRunner:
         checkpoint_dir = os.path.join(self.plots_dir, f'checkpoints_ES_{dim}D_config_{config_idx}')
         os.makedirs(checkpoint_dir, exist_ok=True)
         
-        # --- SMART LOADING HELPER ---
-        def smart_load_weights(target_model, source_model):
+        # --- SMART LOADING HELPER (ES uses zero init, PPO uses random init) ---
+        def smart_load_weights(target_model, source_model, random_cond_init=False, cond_scale=1e-3):
             """
             Smart weight loading that handles input layer shape mismatch.
             
             Problem: Unconditional model has input [x, t], conditional has [x, cond, t]
-            Solution: Splice ZERO weights for conditioning input to ignore it initially
+            Solution: Splice weights for conditioning input
+            
+            Args:
+                random_cond_init: If True, use small random weights (for PPO bootstrapping)
+                                 If False, use zeros (for ES warmup)
+                cond_scale: Scale for random initialization (default 1e-3)
             """
             pretrained_state = source_model.model.state_dict()
             current_state = target_model.model.state_dict()
@@ -1347,14 +1371,19 @@ class AblationRunner:
                         w_x = pre_w[:, :dim]
                         w_t = pre_w[:, dim:]
                         
-                        # Create ZERO weights for the condition (middle part)
-                        # This ensures the model initially ignores the condition
-                        w_cond = torch.zeros(pre_w.shape[0], dim, device=self.config.device)
+                        # Create weights for the condition (middle part)
+                        if random_cond_init:
+                            # Small random weights for PPO bootstrapping (breaks symmetry)
+                            w_cond = cond_scale * torch.randn(pre_w.shape[0], dim, device=self.config.device)
+                            print(f"    [SMART LOAD] Spliced random weights (scale={cond_scale}) for conditioning input in {key}")
+                        else:
+                            # Zero weights for ES warmup (model ignores condition initially)
+                            w_cond = torch.zeros(pre_w.shape[0], dim, device=self.config.device)
+                            print(f"    [SMART LOAD] Spliced zero weights for conditioning input in {key}")
                         
                         # Concatenate [x, cond, t]
                         new_w = torch.cat([w_x, w_cond, w_t], dim=1)
                         current_state[key] = new_w
-                        print(f"    [SMART LOAD] Spliced zero weights for conditioning input in {key}")
             
             target_model.model.load_state_dict(current_state)
         # ----------------------------
@@ -1369,8 +1398,8 @@ class AblationRunner:
             device=self.config.device,
             conditional=True
         )
-        # Apply smart loading to handle input layer shape mismatch
-        smart_load_weights(cond_x1, ddpm_x1)
+        # Apply smart loading with ZERO init for ES (ES has supervised warmup)
+        smart_load_weights(cond_x1, ddpm_x1, random_cond_init=False)
         print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1")
         
         cond_x2 = MultiDimDDPM(
@@ -1381,8 +1410,8 @@ class AblationRunner:
             device=self.config.device,
             conditional=True
         )
-        # Apply smart loading to handle input layer shape mismatch
-        smart_load_weights(cond_x2, ddpm_x2)
+        # Apply smart loading with ZERO init for ES (ES has supervised warmup)
+        smart_load_weights(cond_x2, ddpm_x2, random_cond_init=False)
         print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2")
         
         # Generate training data - PAIRED (required for ES with supervised loss)
@@ -1614,9 +1643,10 @@ class AblationRunner:
             device=self.config.device,
             conditional=True
         )
-        # Apply smart loading to handle input layer shape mismatch
-        smart_load_weights(cond_x1, ddpm_x1)
-        print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1")
+        # Apply smart loading with RANDOM conditioning init for PPO bootstrapping
+        # CRITICAL: Zero init makes scorer ignore condition → no reward signal → PPO can't learn
+        smart_load_weights(cond_x1, ddpm_x1, random_cond_init=True, cond_scale=1e-3)
+        print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1 (random cond weights for PPO)")
         
         cond_x2 = MultiDimDDPM(
             dim=dim,
@@ -1626,18 +1656,9 @@ class AblationRunner:
             device=self.config.device,
             conditional=True
         )
-        # Apply smart loading to handle input layer shape mismatch
-        smart_load_weights(cond_x2, ddpm_x2)
-        print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2")
-        
-        # Generate training data - UNPAIRED MARGINALS (critical for DDMEC)
-        x1_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 2.0
-        x2_data = torch.randn(self.config.coupling_num_samples, dim) * 1.0 + 10.0  # UNPAIRED (not x1 + 8)
-        
-        dataset_x1 = TensorDataset(x1_data)
-        dataset_x2 = TensorDataset(x2_data)
-        dataloader_x1 = DataLoader(dataset_x1, batch_size=self.config.coupling_batch_size, shuffle=True)
-        dataloader_x2 = DataLoader(dataset_x2, batch_size=self.config.coupling_batch_size, shuffle=True)
+        # Apply smart loading with RANDOM conditioning init for PPO bootstrapping
+        smart_load_weights(cond_x2, ddpm_x2, random_cond_init=True, cond_scale=1e-3)
+        print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2 (random cond weights for PPO)")
         
         # Create REAL PPO trainers with specular scoring
         # actor=cond_x1, scorer=cond_x2 (fixed during phase A)
@@ -1684,27 +1705,16 @@ class AblationRunner:
             })
         
         # ===== REAL PPO COOPERATIVE TRAINING LOOP (Specular Alternation) =====
+        # CRITICAL: Sample marginals on-the-fly instead of iterating full dataset
+        # This reduces compute by ~20-50x while preserving unpaired marginals setting
         for epoch in range(self.config.coupling_epochs):
             epoch_logs = []
             
-            # Create iterators for both dataloaders
-            iter_x1 = iter(dataloader_x1)
-            iter_x2 = iter(dataloader_x2)
-            
-            # Process batches together
-            num_batches = len(dataloader_x1)
-            for batch_idx in range(num_batches):
-                try:
-                    x1_batch = next(iter_x1)[0].to(self.config.device)
-                except StopIteration:
-                    iter_x1 = iter(dataloader_x1)
-                    x1_batch = next(iter_x1)[0].to(self.config.device)
-                
-                try:
-                    x2_batch = next(iter_x2)[0].to(self.config.device)
-                except StopIteration:
-                    iter_x2 = iter(dataloader_x2)
-                    x2_batch = next(iter_x2)[0].to(self.config.device)
+            # Sample fresh unpaired marginals for each update (much faster than dataloader)
+            for _ in range(self.config.ppo_updates_per_epoch):
+                # Sample unpaired marginals on-the-fly
+                x1_batch = torch.randn(self.config.coupling_batch_size, dim, device=self.config.device) * 1.0 + 2.0
+                x2_batch = torch.randn(self.config.coupling_batch_size, dim, device=self.config.device) * 1.0 + 10.0
                 
                 # -------------------------
                 # Phase A: update theta = P(X1|X2), scorer = phi fixed
@@ -1739,7 +1749,7 @@ class AblationRunner:
             epoch_metrics.append(metrics)
             
             # Generate checkpoint plot
-            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight}, clip={ppo_clip}, lr={lr}')
+            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
             
             # Log to wandb
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -1773,9 +1783,10 @@ class AblationRunner:
         num_eval = 1000
         
         try:
-            # Generate test data
+            # Generate test data with slight noise for MI to be finite
+            # Deterministic coupling (x2 = x1 + 8) makes MI infinite; add small noise
             x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
-            x2_true = x1_true + 8.0
+            x2_true = x1_true + 8.0 + 0.1 * torch.randn_like(x1_true)  # Add noise for finite MI
             
             # Sample from conditional models with error handling
             # Always use proper conditioning (no shuffling)
@@ -2062,7 +2073,7 @@ Config: {config_str}
 
 Total Epochs: {len(all_metrics)} (warmup: {len(warmup_metrics)}, training: {len(training_metrics)})
 
-Latest Metrics (Epoch {epoch}):
+Latest Metrics (Epoch {latest['epoch']}):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 Primary:
   Loss:         {latest['loss']:.4f}
@@ -2152,7 +2163,7 @@ Learned vs Target:
             f.write(f"  Correlation: {best_ppo['correlation']:.4f}\n")
             f.write(f"  MAE: {best_ppo['mae']:.4f}\n\n")
             
-            f.write(f"WINNER: {'ES' if best_es['kl_div_total'] < best_ppo['kl_div_total'] else 'PPO'}\n")
+            f.write(f"WINNER: {'ES' if self._score_config(best_es) < self._score_config(best_ppo) else 'PPO'}\n")
         
         print(f"  Dimension summary saved: {summary_path}")
         
@@ -2194,9 +2205,9 @@ Learned vs Target:
         """Generate comprehensive ablation plots for a dimension with ALL metrics."""
         results = self.all_results[dim]
         
-        # Main ablation plot (expanded from 9 to 16 subplots)
-        fig = plt.figure(figsize=(28, 20))
-        gs = GridSpec(4, 4, figure=fig)
+        # Main ablation plot (expanded from 9 to 16 subplots + text panel)
+        fig = plt.figure(figsize=(28, 24))
+        gs = GridSpec(5, 4, figure=fig)  # 5 rows to accommodate text panel
         
         # ES: sigma vs KL
         ax1 = fig.add_subplot(gs[0, 0])
@@ -2319,7 +2330,7 @@ Learned vs Target:
         ax8.set_xticks(range(len(lr_vals_ppo)))
         ax8.set_yticks(range(len(kl_weights)))
         ax8.set_xticklabels([f'{lr:.5f}' for lr in lr_vals_ppo], rotation=45)
-        ax8.set_yticklabels([f'{kl_w:.2f}' for kl_w in kl_weights])
+        ax8.set_yticklabels([f'{kl_w:.1e}' for kl_w in kl_weights])
         ax8.set_xlabel('Learning Rate')
         ax8.set_ylabel('KL Weight')
         ax8.set_title(f'PPO: KL Heatmap ({dim}D)')
@@ -2421,8 +2432,9 @@ Learned vs Target:
         ax14.legend()
         ax14.grid(True, axis='y')
         
-        # Learned statistics - means
-        ax15 = fig.add_subplot(gs[3, :2])
+        # Learned statistics - means (use row 4 to avoid overlap with row 3)
+        ax15 = fig.add_subplot(gs[4, :])
+        ax15.axis('off')  # Hide axes for text display
         ax15.text(0.5, 0.9, 'Best Configuration Learned Statistics', ha='center', fontsize=12, fontweight='bold', transform=ax15.transAxes)
         
         stats_text = f"""
@@ -2430,7 +2442,7 @@ ES Best Config (σ={best_es['sigma']}, lr={best_es['lr']}):
   μ1: {best_es['mu1_learned']:.3f} (target: 2.0)    μ2: {best_es['mu2_learned']:.3f} (target: 10.0)
   σ1: {best_es['std1_learned']:.3f} (target: 1.0)    σ2: {best_es['std2_learned']:.3f} (target: 1.0)
 
-PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={best_ppo['lr']}):
+PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, lr={best_ppo['lr']}):
   μ1: {best_ppo['mu1_learned']:.3f} (target: 2.0)    μ2: {best_ppo['mu2_learned']:.3f} (target: 10.0)
   σ1: {best_ppo['std1_learned']:.3f} (target: 1.0)    σ2: {best_ppo['std2_learned']:.3f} (target: 1.0)
         """
@@ -2471,15 +2483,15 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
             
             for dim in sorted(self.all_results.keys()):
                 results = self.all_results[dim]
-                best_es = min(results['ES'], key=lambda x: x['kl_div_total'])
-                best_ppo = min(results['PPO'], key=lambda x: x['kl_div_total'])
+                best_es = min(results['ES'], key=self._score_config)
+                best_ppo = min(results['PPO'], key=self._score_config)
                 
                 f.write(f"{dim}D:\n")
                 f.write(f"  ES  - sigma={best_es['sigma']:<6.4f} lr={best_es['lr']:<8.6f} "
-                       f"KL={best_es['kl_div_total']:<8.4f} Corr={best_es['correlation']:<6.4f}\n")
-                f.write(f"  PPO - kl_w={best_ppo['kl_weight']:<6.2f} clip={best_ppo['ppo_clip']:<6.2f} "
-                       f"lr={best_ppo['lr']:<8.6f} KL={best_ppo['kl_div_total']:<8.4f} Corr={best_ppo['correlation']:<6.4f}\n")
-                f.write(f"  WINNER: {'ES' if best_es['kl_div_total'] < best_ppo['kl_div_total'] else 'PPO'}\n\n")
+                       f"KL={best_es['kl_div_total']:<8.4f} Corr={best_es['correlation']:<6.4f} MAE={best_es['mae']:<6.4f}\n")
+                f.write(f"  PPO - kl_w={best_ppo['kl_weight']:<6.1e} clip={best_ppo['ppo_clip']:<6.2f} "
+                       f"lr={best_ppo['lr']:<8.6f} KL={best_ppo['kl_div_total']:<8.4f} Corr={best_ppo['correlation']:<6.4f} MAE={best_ppo['mae']:<6.4f}\n")
+                f.write(f"  WINNER: {'ES' if self._score_config(best_es) < self._score_config(best_ppo) else 'PPO'}\n\n")
             
             # Overall statistics
             f.write("\n" + "="*100 + "\n")
@@ -2490,9 +2502,9 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
             ppo_wins = 0
             
             for dim in self.all_results.keys():
-                best_es = min(self.all_results[dim]['ES'], key=lambda x: x['kl_div_total'])
-                best_ppo = min(self.all_results[dim]['PPO'], key=lambda x: x['kl_div_total'])
-                if best_es['kl_div_total'] < best_ppo['kl_div_total']:
+                best_es = min(self.all_results[dim]['ES'], key=self._score_config)
+                best_ppo = min(self.all_results[dim]['PPO'], key=self._score_config)
+                if self._score_config(best_es) < self._score_config(best_ppo):
                     es_wins += 1
                 else:
                     ppo_wins += 1
@@ -2534,13 +2546,13 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
         
         dims = sorted(self.all_results.keys())
         
-        # Best KL per dimension
+        # Best KL per dimension (using score-based best configs)
         ax1 = fig.add_subplot(gs[0, 0])
         es_kls = []
         ppo_kls = []
         for dim in dims:
-            best_es = min(self.all_results[dim]['ES'], key=lambda x: x['kl_div_total'])
-            best_ppo = min(self.all_results[dim]['PPO'], key=lambda x: x['kl_div_total'])
+            best_es = min(self.all_results[dim]['ES'], key=self._score_config)
+            best_ppo = min(self.all_results[dim]['PPO'], key=self._score_config)
             es_kls.append(best_es['kl_div_total'])
             ppo_kls.append(best_ppo['kl_div_total'])
         
@@ -2552,13 +2564,13 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
         ax1.legend()
         ax1.grid(True)
         
-        # Best Correlation per dimension
+        # Best Correlation per dimension (using score-based best configs)
         ax2 = fig.add_subplot(gs[0, 1])
         es_corrs = []
         ppo_corrs = []
         for dim in dims:
-            best_es = min(self.all_results[dim]['ES'], key=lambda x: x['kl_div_total'])
-            best_ppo = min(self.all_results[dim]['PPO'], key=lambda x: x['kl_div_total'])
+            best_es = min(self.all_results[dim]['ES'], key=self._score_config)
+            best_ppo = min(self.all_results[dim]['PPO'], key=self._score_config)
             es_corrs.append(best_es['correlation'])
             ppo_corrs.append(best_ppo['correlation'])
         
@@ -2570,13 +2582,13 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
         ax2.legend()
         ax2.grid(True)
         
-        # Best MAE per dimension
+        # Best MAE per dimension (using score-based best configs)
         ax3 = fig.add_subplot(gs[0, 2])
         es_maes = []
         ppo_maes = []
         for dim in dims:
-            best_es = min(self.all_results[dim]['ES'], key=lambda x: x['kl_div_total'])
-            best_ppo = min(self.all_results[dim]['PPO'], key=lambda x: x['kl_div_total'])
+            best_es = min(self.all_results[dim]['ES'], key=self._score_config)
+            best_ppo = min(self.all_results[dim]['PPO'], key=self._score_config)
             es_maes.append(best_es['mae'])
             ppo_maes.append(best_ppo['mae'])
         
@@ -2588,20 +2600,20 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
         ax3.legend()
         ax3.grid(True)
         
-        # Win rate
+        # Win rate (using score-based selection)
         ax4 = fig.add_subplot(gs[1, 0])
-        es_wins = sum(1 for dim in dims if min(self.all_results[dim]['ES'], key=lambda x: x['kl_div_total'])['kl_div_total'] 
-                     < min(self.all_results[dim]['PPO'], key=lambda x: x['kl_div_total'])['kl_div_total'])
+        es_wins = sum(1 for dim in dims if self._score_config(min(self.all_results[dim]['ES'], key=self._score_config)) 
+                     < self._score_config(min(self.all_results[dim]['PPO'], key=self._score_config)))
         ppo_wins = len(dims) - es_wins
         
         ax4.bar(['ES', 'PPO'], [es_wins, ppo_wins], color=['#1f77b4', '#ff7f0e'])
         ax4.set_ylabel('Number of Wins')
-        ax4.set_title('Overall Win Count (by KL)')
+        ax4.set_title('Overall Win Count (by Score)')
         ax4.grid(True, axis='y')
         
-        # Best hyperparameters distribution - ES
+        # Best hyperparameters distribution - ES (using score-based selection)
         ax5 = fig.add_subplot(gs[1, 1])
-        best_sigmas = [min(self.all_results[dim]['ES'], key=lambda x: x['kl_div_total'])['sigma'] for dim in dims]
+        best_sigmas = [min(self.all_results[dim]['ES'], key=self._score_config)['sigma'] for dim in dims]
         best_es_lrs = [min(self.all_results[dim]['ES'], key=self._score_config)['lr'] for dim in dims]
         
         ax5.scatter(best_sigmas, best_es_lrs, s=100, c=dims, cmap='viridis')
@@ -2612,9 +2624,9 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
         ax5.set_yscale('log')
         ax5.grid(True)
         
-        # Best hyperparameters distribution - PPO
+        # Best hyperparameters distribution - PPO (using score-based selection)
         ax6 = fig.add_subplot(gs[1, 2])
-        best_kl_weights = [min(self.all_results[dim]['PPO'], key=lambda x: x['kl_div_total'])['kl_weight'] for dim in dims]
+        best_kl_weights = [min(self.all_results[dim]['PPO'], key=self._score_config)['kl_weight'] for dim in dims]
         best_ppo_lrs = [min(self.all_results[dim]['PPO'], key=self._score_config)['lr'] for dim in dims]
         
         ax6.scatter(best_kl_weights, best_ppo_lrs, s=100, c=dims, cmap='viridis')
@@ -2653,35 +2665,37 @@ def main():
                        help="Dimensions to test")
     
     # Training parameters
-    parser.add_argument("--coupling-epochs", type=int, default=15,
-                       help="Number of epochs for coupling training")
+    parser.add_argument("--coupling-epochs", type=int, default=14,
+                       help="Number of epochs for coupling training (match config default)")
     parser.add_argument("--ddpm-epochs", type=int, default=200,
                        help="Number of epochs for DDPM pretraining")
     
-    # ES ablation ranges
+    # ES ablation ranges (match AblationConfig defaults)
     parser.add_argument("--es-sigma-values", type=float, nargs='+', 
                        default=[0.001, 0.002, 0.005, 0.01],
                        help="ES sigma values to test")
     parser.add_argument("--es-lr-values", type=float, nargs='+',
-                       default=[0.0005, 0.001, 0.002, 0.005],
+                       default=[0.0001, 0.0002, 0.0005, 0.001],
                        help="ES learning rate values to test")
     
-    # PPO ablation ranges
+    # PPO ablation ranges (match AblationConfig defaults - CRITICAL: was [0.1,0.3,0.5,0.7])
     parser.add_argument("--ppo-kl-values", type=float, nargs='+',
-                       default=[0.1, 0.3, 0.5, 0.7],
+                       default=[1e-4, 3e-4, 1e-3, 3e-3],
                        help="PPO KL weight values to test")
     parser.add_argument("--ppo-clip-values", type=float, nargs='+',
-                       default=[0.05, 0.1, 0.2, 0.3],
+                       default=[0.02, 0.05, 0.1],
                        help="PPO clip values to test")
     parser.add_argument("--ppo-lr-values", type=float, nargs='+',
-                       default=[5e-5, 1e-4, 2e-4, 5e-4],
+                       default=[1e-5, 2e-5, 5e-5, 1e-4],
                        help="PPO learning rate values to test")
     
     # Output
     parser.add_argument("--output-dir", type=str, default="ablation_results",
                        help="Output directory")
-    parser.add_argument("--use-wandb", action="store_true",
-                       help="Enable WandB logging")
+    parser.add_argument("--use-wandb", action="store_true", default=None,
+                       help="Enable WandB logging (default: from config)")
+    parser.add_argument("--no-wandb", dest="use_wandb", action="store_false",
+                       help="Disable WandB logging")
     parser.add_argument("--wandb-project", type=str, default="ddmec-ablation",
                        help="WandB project name")
     parser.add_argument("--seed", type=int, default=42,
@@ -2702,6 +2716,9 @@ def main():
         args.reuse_pretrained = False
     
     # Create config
+    # Handle WandB default: use config default if argparse didn't set it
+    use_wandb = args.use_wandb if args.use_wandb is not None else AblationConfig.use_wandb
+    
     config = AblationConfig(
         dimensions=args.dimensions,
         coupling_epochs=args.coupling_epochs,
@@ -2712,7 +2729,7 @@ def main():
         ppo_clip_values=args.ppo_clip_values,
         ppo_lr_values=args.ppo_lr_values,
         output_dir=args.output_dir,
-        use_wandb=args.use_wandb,
+        use_wandb=use_wandb,
         wandb_project=args.wandb_project,
         seed=args.seed,
         reuse_pretrained=args.reuse_pretrained,
