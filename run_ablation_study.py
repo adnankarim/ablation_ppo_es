@@ -637,8 +637,17 @@ class MultiDimDDPM:
         }, path)
     
     def load(self, path: str):
-        """Load model."""
+        """Load model with safety checks."""
         checkpoint = torch.load(path, map_location=self.device)
+        
+        # Verify checkpoint matches current model configuration
+        assert checkpoint['dim'] == self.dim, \
+            f"Checkpoint dim {checkpoint['dim']} != model dim {self.dim}"
+        assert checkpoint['timesteps'] == self.timesteps, \
+            f"Checkpoint timesteps {checkpoint['timesteps']} != model timesteps {self.timesteps}"
+        assert checkpoint['conditional'] == self.conditional, \
+            f"Checkpoint conditional {checkpoint['conditional']} != model conditional {self.conditional}"
+        
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     
@@ -966,25 +975,38 @@ class DDMECPPOTrainer:
     @torch.no_grad()
     def _estimate_reward(self, y_target: torch.Tensor, x_condition: torch.Tensor) -> torch.Tensor:
         """
-        Reward ≈ log p_scorer(y_target | x_condition)
-        Proxy via negative denoising MSE on random timesteps (MC average).
+        Contrastive reward: log p_scorer(y_target | x_condition) - log p_scorer(y_target | x_condition_shuffled)
+        
+        This prevents degenerate equilibrium where both actor and scorer ignore conditioning.
+        By taking the difference, we force the reward to depend on the conditioning signal.
         """
         self.scorer.model.eval()
         B = y_target.shape[0]
-        total = torch.zeros(B, device=self.device)
 
-        for _ in range(self.mc_reward_steps):
-            t = torch.randint(0, self.scorer.timesteps, (B,), device=self.device)
-            noise = torch.randn_like(y_target)
-            y_t = self.scorer.q_sample(y_target, t, noise)
-            if self.scorer.conditional:
-                eps_pred = self.scorer.model(y_t, t, self.scorer.t_scale, x_condition)
-            else:
-                eps_pred = self.scorer.model(y_t, t, self.scorer.t_scale)
-            mse = ((eps_pred - noise) ** 2).mean(dim=-1)  # per-sample
-            total += (-mse)
+        def score(y, xcond):
+            """Score function: negative denoising MSE (proxy for log-likelihood)."""
+            total = torch.zeros(B, device=self.device)
+            for _ in range(self.mc_reward_steps):
+                t = torch.randint(0, self.scorer.timesteps, (B,), device=self.device)
+                noise = torch.randn_like(y)
+                y_t = self.scorer.q_sample(y, t, noise)
+                if self.scorer.conditional:
+                    eps_pred = self.scorer.model(y_t, t, self.scorer.t_scale, xcond)
+                else:
+                    eps_pred = self.scorer.model(y_t, t, self.scorer.t_scale)
+                mse = ((eps_pred - noise) ** 2).mean(dim=-1)  # per-sample
+                total += (-mse)
+            return total / float(self.mc_reward_steps)
 
-        return total / float(self.mc_reward_steps)
+        # Positive: correct pairing
+        r_pos = score(y_target, x_condition)
+        
+        # Negative: shuffled pairing (breaks coupling)
+        x_shuf = x_condition[torch.randperm(B, device=self.device)]
+        r_neg = score(y_target, x_shuf)
+
+        # Contrastive reward: difference forces conditioning dependence
+        return r_pos - r_neg
 
     @torch.no_grad()
     def _collect_rollout(self, y_cond: torch.Tensor):
@@ -2210,8 +2232,11 @@ Learned vs Target:
         
         # Find best configurations using composite score (not just KL)
         # KL alone can select models that ignore conditioning
-        best_es = min(results['ES'], key=self._score_config)
-        best_ppo = min(results['PPO'], key=self._score_config)
+        has_es = len(results['ES']) > 0
+        has_ppo = len(results['PPO']) > 0
+        
+        best_es = min(results['ES'], key=self._score_config) if has_es else None
+        best_ppo = min(results['PPO'], key=self._score_config) if has_ppo else None
         
         summary_path = os.path.join(self.logs_dir, f"summary_{dim}d.txt")
         
@@ -2220,22 +2245,35 @@ Learned vs Target:
             f.write(f"ABLATION SUMMARY: {dim}D\n")
             f.write(f"="*80 + "\n\n")
             
-            f.write("BEST ES CONFIGURATION:\n")
-            f.write(f"  sigma: {best_es['sigma']}\n")
-            f.write(f"  lr: {best_es['lr']}\n")
-            f.write(f"  KL Total: {best_es['kl_div_total']:.4f}\n")
-            f.write(f"  Correlation: {best_es['correlation']:.4f}\n")
-            f.write(f"  MAE: {best_es['mae']:.4f}\n\n")
+            if has_es:
+                f.write("BEST ES CONFIGURATION:\n")
+                f.write(f"  sigma: {best_es['sigma']}\n")
+                f.write(f"  lr: {best_es['lr']}\n")
+                f.write(f"  KL Total: {best_es['kl_div_total']:.4f}\n")
+                f.write(f"  Correlation: {best_es['correlation']:.4f}\n")
+                f.write(f"  MAE: {best_es['mae']:.4f}\n\n")
+            else:
+                f.write("BEST ES CONFIGURATION: (skipped --only-method PPO)\n\n")
             
-            f.write("BEST PPO CONFIGURATION:\n")
-            f.write(f"  kl_weight: {best_ppo['kl_weight']}\n")
-            f.write(f"  ppo_clip: {best_ppo['ppo_clip']}\n")
-            f.write(f"  lr: {best_ppo['lr']}\n")
-            f.write(f"  KL Total: {best_ppo['kl_div_total']:.4f}\n")
-            f.write(f"  Correlation: {best_ppo['correlation']:.4f}\n")
-            f.write(f"  MAE: {best_ppo['mae']:.4f}\n\n")
+            if has_ppo:
+                f.write("BEST PPO CONFIGURATION:\n")
+                f.write(f"  kl_weight: {best_ppo['kl_weight']:.1e}\n")
+                f.write(f"  ppo_clip: {best_ppo['ppo_clip']}\n")
+                f.write(f"  lr: {best_ppo['lr']}\n")
+                f.write(f"  KL Total: {best_ppo['kl_div_total']:.4f}\n")
+                f.write(f"  Correlation: {best_ppo['correlation']:.4f}\n")
+                f.write(f"  MAE: {best_ppo['mae']:.4f}\n\n")
+            else:
+                f.write("BEST PPO CONFIGURATION: (skipped --only-method ES)\n\n")
             
-            f.write(f"WINNER: {'ES' if self._score_config(best_es) < self._score_config(best_ppo) else 'PPO'}\n")
+            if has_es and has_ppo:
+                f.write(f"WINNER: {'ES' if self._score_config(best_es) < self._score_config(best_ppo) else 'PPO'}\n")
+            elif has_es:
+                f.write("WINNER: ES (only method run)\n")
+            elif has_ppo:
+                f.write("WINNER: PPO (only method run)\n")
+            else:
+                f.write("WINNER: (no methods run)\n")
         
         print(f"  Dimension summary saved: {summary_path}")
         
@@ -2287,7 +2325,7 @@ Learned vs Target:
         for r in results['PPO']:
             key = (r['kl_weight'], r['lr'])
             ppo_agg.setdefault(key, []).append(r)
-        ppo_best = [best_over_clip(v) for v in ppo_agg.values()]
+        ppo_best = [best_over_clip(v) for v in ppo_agg.values()] if len(results['PPO']) > 0 else []
         
         # Main ablation plot (expanded from 9 to 16 subplots + text panel)
         fig = plt.figure(figsize=(28, 24))
@@ -2422,12 +2460,25 @@ Learned vs Target:
         
         # Best configs comparison
         ax9 = fig.add_subplot(gs[2, 2])
-        best_es = min(results['ES'], key=self._score_config)
-        best_ppo = min(results['PPO'], key=self._score_config)
+        has_es = len(results['ES']) > 0
+        has_ppo = len(results['PPO']) > 0
+        
+        best_es = min(results['ES'], key=self._score_config) if has_es else None
+        best_ppo = min(results['PPO'], key=self._score_config) if has_ppo else None
         
         metrics = ['kl_div_total', 'correlation', 'mae', 'mutual_information']
-        es_vals = [best_es[m] for m in metrics]
-        ppo_vals = [best_ppo[m] for m in metrics]
+        if has_es and has_ppo:
+            es_vals = [best_es[m] for m in metrics]
+            ppo_vals = [best_ppo[m] for m in metrics]
+        elif has_es:
+            es_vals = [best_es[m] for m in metrics]
+            ppo_vals = [0.0] * len(metrics)  # Placeholder
+        elif has_ppo:
+            es_vals = [0.0] * len(metrics)  # Placeholder
+            ppo_vals = [best_ppo[m] for m in metrics]
+        else:
+            es_vals = [0.0] * len(metrics)
+            ppo_vals = [0.0] * len(metrics)
         
         x = np.arange(len(metrics))
         width = 0.35
@@ -2521,7 +2572,8 @@ Learned vs Target:
         ax15.axis('off')  # Hide axes for text display
         ax15.text(0.5, 0.9, 'Best Configuration Learned Statistics', ha='center', fontsize=12, fontweight='bold', transform=ax15.transAxes)
         
-        stats_text = f"""
+        if has_es and has_ppo:
+            stats_text = f"""
 ES Best Config (σ={best_es['sigma']}, lr={best_es['lr']}):
   μ1: {best_es['mu1_learned']:.3f} (target: 2.0)    μ2: {best_es['mu2_learned']:.3f} (target: 10.0)
   σ1: {best_es['std1_learned']:.3f} (target: 1.0)    σ2: {best_es['std2_learned']:.3f} (target: 1.0)
@@ -2529,7 +2581,25 @@ ES Best Config (σ={best_es['sigma']}, lr={best_es['lr']}):
 PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, lr={best_ppo['lr']}):
   μ1: {best_ppo['mu1_learned']:.3f} (target: 2.0)    μ2: {best_ppo['mu2_learned']:.3f} (target: 10.0)
   σ1: {best_ppo['std1_learned']:.3f} (target: 1.0)    σ2: {best_ppo['std2_learned']:.3f} (target: 1.0)
-        """
+            """
+        elif has_es:
+            stats_text = f"""
+ES Best Config (σ={best_es['sigma']}, lr={best_es['lr']}):
+  μ1: {best_es['mu1_learned']:.3f} (target: 2.0)    μ2: {best_es['mu2_learned']:.3f} (target: 10.0)
+  σ1: {best_es['std1_learned']:.3f} (target: 1.0)    σ2: {best_es['std2_learned']:.3f} (target: 1.0)
+
+PPO: (skipped --only-method ES)
+            """
+        elif has_ppo:
+            stats_text = f"""
+ES: (skipped --only-method PPO)
+
+PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, lr={best_ppo['lr']}):
+  μ1: {best_ppo['mu1_learned']:.3f} (target: 2.0)    μ2: {best_ppo['mu2_learned']:.3f} (target: 10.0)
+  σ1: {best_ppo['std1_learned']:.3f} (target: 1.0)    σ2: {best_ppo['std2_learned']:.3f} (target: 1.0)
+            """
+        else:
+            stats_text = "\nNo methods run (both skipped)\n"
         ax15.text(0.1, 0.4, stats_text, fontsize=10, family='monospace',
                  verticalalignment='center', transform=ax15.transAxes,
                  bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
@@ -2567,15 +2637,31 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
             
             for dim in sorted(self.all_results.keys()):
                 results = self.all_results[dim]
-                best_es = min(results['ES'], key=self._score_config)
-                best_ppo = min(results['PPO'], key=self._score_config)
+                has_es = len(results['ES']) > 0
+                has_ppo = len(results['PPO']) > 0
+                
+                best_es = min(results['ES'], key=self._score_config) if has_es else None
+                best_ppo = min(results['PPO'], key=self._score_config) if has_ppo else None
                 
                 f.write(f"{dim}D:\n")
-                f.write(f"  ES  - sigma={best_es['sigma']:<6.4f} lr={best_es['lr']:<8.6f} "
-                       f"KL={best_es['kl_div_total']:<8.4f} Corr={best_es['correlation']:<6.4f} MAE={best_es['mae']:<6.4f}\n")
-                f.write(f"  PPO - kl_w={best_ppo['kl_weight']:<6.1e} clip={best_ppo['ppo_clip']:<6.2f} "
-                       f"lr={best_ppo['lr']:<8.6f} KL={best_ppo['kl_div_total']:<8.4f} Corr={best_ppo['correlation']:<6.4f} MAE={best_ppo['mae']:<6.4f}\n")
-                f.write(f"  WINNER: {'ES' if self._score_config(best_es) < self._score_config(best_ppo) else 'PPO'}\n\n")
+                if has_es:
+                    f.write(f"  ES  - sigma={best_es['sigma']:<6.4f} lr={best_es['lr']:<8.6f} "
+                           f"KL={best_es['kl_div_total']:<8.4f} Corr={best_es['correlation']:<6.4f} MAE={best_es['mae']:<6.4f}\n")
+                else:
+                    f.write(f"  ES  - (skipped --only-method PPO)\n")
+                if has_ppo:
+                    f.write(f"  PPO - kl_w={best_ppo['kl_weight']:<6.1e} clip={best_ppo['ppo_clip']:<6.2f} "
+                           f"lr={best_ppo['lr']:<8.6f} KL={best_ppo['kl_div_total']:<8.4f} Corr={best_ppo['correlation']:<6.4f} MAE={best_ppo['mae']:<6.4f}\n")
+                else:
+                    f.write(f"  PPO - (skipped --only-method ES)\n")
+                if has_es and has_ppo:
+                    f.write(f"  WINNER: {'ES' if self._score_config(best_es) < self._score_config(best_ppo) else 'PPO'}\n\n")
+                elif has_es:
+                    f.write(f"  WINNER: ES (only method run)\n\n")
+                elif has_ppo:
+                    f.write(f"  WINNER: PPO (only method run)\n\n")
+                else:
+                    f.write(f"  WINNER: (no methods run)\n\n")
             
             # Overall statistics
             f.write("\n" + "="*100 + "\n")
@@ -2586,11 +2672,20 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
             ppo_wins = 0
             
             for dim in self.all_results.keys():
-                best_es = min(self.all_results[dim]['ES'], key=self._score_config)
-                best_ppo = min(self.all_results[dim]['PPO'], key=self._score_config)
-                if self._score_config(best_es) < self._score_config(best_ppo):
+                results = self.all_results[dim]
+                has_es = len(results['ES']) > 0
+                has_ppo = len(results['PPO']) > 0
+                
+                if has_es and has_ppo:
+                    best_es = min(results['ES'], key=self._score_config)
+                    best_ppo = min(results['PPO'], key=self._score_config)
+                    if self._score_config(best_es) < self._score_config(best_ppo):
+                        es_wins += 1
+                    else:
+                        ppo_wins += 1
+                elif has_es:
                     es_wins += 1
-                else:
+                elif has_ppo:
                     ppo_wins += 1
             
             f.write(f"ES Wins: {es_wins}/{len(self.all_results)} dimensions\n")
@@ -2635,13 +2730,27 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
         es_kls = []
         ppo_kls = []
         for dim in dims:
-            best_es = min(self.all_results[dim]['ES'], key=self._score_config)
-            best_ppo = min(self.all_results[dim]['PPO'], key=self._score_config)
-            es_kls.append(best_es['kl_div_total'])
-            ppo_kls.append(best_ppo['kl_div_total'])
+            results = self.all_results[dim]
+            has_es = len(results['ES']) > 0
+            has_ppo = len(results['PPO']) > 0
+            if has_es:
+                best_es = min(results['ES'], key=self._score_config)
+                es_kls.append(best_es['kl_div_total'])
+            else:
+                es_kls.append(None)
+            if has_ppo:
+                best_ppo = min(results['PPO'], key=self._score_config)
+                ppo_kls.append(best_ppo['kl_div_total'])
+            else:
+                ppo_kls.append(None)
         
-        ax1.plot(dims, es_kls, marker='o', linewidth=2, markersize=8, label='Best ES')
-        ax1.plot(dims, ppo_kls, marker='s', linewidth=2, markersize=8, label='Best PPO')
+        # Filter out None values for plotting
+        es_dims_kl = [(d, k) for d, k in zip(dims, es_kls) if k is not None]
+        ppo_dims_kl = [(d, k) for d, k in zip(dims, ppo_kls) if k is not None]
+        if es_dims_kl:
+            ax1.plot([d for d, _ in es_dims_kl], [k for _, k in es_dims_kl], marker='o', linewidth=2, markersize=8, label='Best ES')
+        if ppo_dims_kl:
+            ax1.plot([d for d, _ in ppo_dims_kl], [k for _, k in ppo_dims_kl], marker='s', linewidth=2, markersize=8, label='Best PPO')
         ax1.set_xlabel('Dimension')
         ax1.set_ylabel('KL Divergence (Total)')
         ax1.set_title('Best KL Divergence Across Dimensions')
@@ -2653,13 +2762,26 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
         es_corrs = []
         ppo_corrs = []
         for dim in dims:
-            best_es = min(self.all_results[dim]['ES'], key=self._score_config)
-            best_ppo = min(self.all_results[dim]['PPO'], key=self._score_config)
-            es_corrs.append(best_es['correlation'])
-            ppo_corrs.append(best_ppo['correlation'])
+            results = self.all_results[dim]
+            has_es = len(results['ES']) > 0
+            has_ppo = len(results['PPO']) > 0
+            if has_es:
+                best_es = min(results['ES'], key=self._score_config)
+                es_corrs.append(best_es['correlation'])
+            else:
+                es_corrs.append(None)
+            if has_ppo:
+                best_ppo = min(results['PPO'], key=self._score_config)
+                ppo_corrs.append(best_ppo['correlation'])
+            else:
+                ppo_corrs.append(None)
         
-        ax2.plot(dims, es_corrs, marker='o', linewidth=2, markersize=8, label='Best ES')
-        ax2.plot(dims, ppo_corrs, marker='s', linewidth=2, markersize=8, label='Best PPO')
+        es_dims_corr = [(d, c) for d, c in zip(dims, es_corrs) if c is not None]
+        ppo_dims_corr = [(d, c) for d, c in zip(dims, ppo_corrs) if c is not None]
+        if es_dims_corr:
+            ax2.plot([d for d, _ in es_dims_corr], [c for _, c in es_dims_corr], marker='o', linewidth=2, markersize=8, label='Best ES')
+        if ppo_dims_corr:
+            ax2.plot([d for d, _ in ppo_dims_corr], [c for _, c in ppo_dims_corr], marker='s', linewidth=2, markersize=8, label='Best PPO')
         ax2.set_xlabel('Dimension')
         ax2.set_ylabel('Correlation')
         ax2.set_title('Best Correlation Across Dimensions')
@@ -2671,13 +2793,26 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
         es_maes = []
         ppo_maes = []
         for dim in dims:
-            best_es = min(self.all_results[dim]['ES'], key=self._score_config)
-            best_ppo = min(self.all_results[dim]['PPO'], key=self._score_config)
-            es_maes.append(best_es['mae'])
-            ppo_maes.append(best_ppo['mae'])
+            results = self.all_results[dim]
+            has_es = len(results['ES']) > 0
+            has_ppo = len(results['PPO']) > 0
+            if has_es:
+                best_es = min(results['ES'], key=self._score_config)
+                es_maes.append(best_es['mae'])
+            else:
+                es_maes.append(None)
+            if has_ppo:
+                best_ppo = min(results['PPO'], key=self._score_config)
+                ppo_maes.append(best_ppo['mae'])
+            else:
+                ppo_maes.append(None)
         
-        ax3.plot(dims, es_maes, marker='o', linewidth=2, markersize=8, label='Best ES')
-        ax3.plot(dims, ppo_maes, marker='s', linewidth=2, markersize=8, label='Best PPO')
+        es_dims_mae = [(d, m) for d, m in zip(dims, es_maes) if m is not None]
+        ppo_dims_mae = [(d, m) for d, m in zip(dims, ppo_maes) if m is not None]
+        if es_dims_mae:
+            ax3.plot([d for d, _ in es_dims_mae], [m for _, m in es_dims_mae], marker='o', linewidth=2, markersize=8, label='Best ES')
+        if ppo_dims_mae:
+            ax3.plot([d for d, _ in ppo_dims_mae], [m for _, m in ppo_dims_mae], marker='s', linewidth=2, markersize=8, label='Best PPO')
         ax3.set_xlabel('Dimension')
         ax3.set_ylabel('MAE')
         ax3.set_title('Best MAE Across Dimensions')
@@ -2686,9 +2821,23 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
         
         # Win rate (using score-based selection)
         ax4 = fig.add_subplot(gs[1, 0])
-        es_wins = sum(1 for dim in dims if self._score_config(min(self.all_results[dim]['ES'], key=self._score_config)) 
-                     < self._score_config(min(self.all_results[dim]['PPO'], key=self._score_config)))
-        ppo_wins = len(dims) - es_wins
+        es_wins = 0
+        ppo_wins = 0
+        for dim in dims:
+            results = self.all_results[dim]
+            has_es = len(results['ES']) > 0
+            has_ppo = len(results['PPO']) > 0
+            if has_es and has_ppo:
+                best_es = min(results['ES'], key=self._score_config)
+                best_ppo = min(results['PPO'], key=self._score_config)
+                if self._score_config(best_es) < self._score_config(best_ppo):
+                    es_wins += 1
+                else:
+                    ppo_wins += 1
+            elif has_es:
+                es_wins += 1
+            elif has_ppo:
+                ppo_wins += 1
         
         ax4.bar(['ES', 'PPO'], [es_wins, ppo_wins], color=['#1f77b4', '#ff7f0e'])
         ax4.set_ylabel('Number of Wins')
@@ -2697,10 +2846,19 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
         
         # Best hyperparameters distribution - ES (using score-based selection)
         ax5 = fig.add_subplot(gs[1, 1])
-        best_sigmas = [min(self.all_results[dim]['ES'], key=self._score_config)['sigma'] for dim in dims]
-        best_es_lrs = [min(self.all_results[dim]['ES'], key=self._score_config)['lr'] for dim in dims]
+        best_sigmas = []
+        best_es_lrs = []
+        es_dims = []
+        for dim in dims:
+            results = self.all_results[dim]
+            if len(results['ES']) > 0:
+                best_es = min(results['ES'], key=self._score_config)
+                best_sigmas.append(best_es['sigma'])
+                best_es_lrs.append(best_es['lr'])
+                es_dims.append(dim)
         
-        ax5.scatter(best_sigmas, best_es_lrs, s=100, c=dims, cmap='viridis')
+        if best_sigmas:
+            ax5.scatter(best_sigmas, best_es_lrs, s=100, c=es_dims, cmap='viridis')
         ax5.set_xlabel('Best Sigma')
         ax5.set_ylabel('Best LR')
         ax5.set_title('ES: Best Hyperparameters (colored by dimension)')
@@ -2710,10 +2868,19 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
         
         # Best hyperparameters distribution - PPO (using score-based selection)
         ax6 = fig.add_subplot(gs[1, 2])
-        best_kl_weights = [min(self.all_results[dim]['PPO'], key=self._score_config)['kl_weight'] for dim in dims]
-        best_ppo_lrs = [min(self.all_results[dim]['PPO'], key=self._score_config)['lr'] for dim in dims]
+        best_kl_weights = []
+        best_ppo_lrs = []
+        ppo_dims = []
+        for dim in dims:
+            results = self.all_results[dim]
+            if len(results['PPO']) > 0:
+                best_ppo = min(results['PPO'], key=self._score_config)
+                best_kl_weights.append(best_ppo['kl_weight'])
+                best_ppo_lrs.append(best_ppo['lr'])
+                ppo_dims.append(dim)
         
-        ax6.scatter(best_kl_weights, best_ppo_lrs, s=100, c=dims, cmap='viridis')
+        if best_kl_weights:
+            ax6.scatter(best_kl_weights, best_ppo_lrs, s=100, c=ppo_dims, cmap='viridis')
         ax6.set_xlabel('Best KL Weight')
         ax6.set_ylabel('Best LR')
         ax6.set_title('PPO: Best Hyperparameters (colored by dimension)')
@@ -2811,7 +2978,9 @@ def main():
     
     # Create config
     # Handle WandB default: use config default if argparse didn't set it
-    use_wandb = args.use_wandb if args.use_wandb is not None else AblationConfig.use_wandb
+    # CRITICAL: AblationConfig.use_wandb is a Field object, need to instantiate to get actual value
+    default_use_wandb = AblationConfig().use_wandb
+    use_wandb = args.use_wandb if args.use_wandb is not None else default_use_wandb
     
     config = AblationConfig(
         dimensions=args.dimensions,
