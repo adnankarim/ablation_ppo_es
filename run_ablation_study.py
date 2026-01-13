@@ -371,10 +371,10 @@ class AblationConfig:
     es_sigma_values: List[float] = field(default_factory=lambda: [0.001, 0.002, 0.005, 0.01])
     es_lr_values: List[float] = field(default_factory=lambda: [0.0001, 0.0002, 0.0005, 0.001])  # Reduced to prevent divergence
     
-    # PPO Ablations
-    ppo_kl_weight_values: List[float] = field(default_factory=lambda: [0.1, 0.3, 0.5, 0.7])
-    ppo_clip_values: List[float] = field(default_factory=lambda: [0.05, 0.1, 0.2, 0.3])
-    ppo_lr_values: List[float] = field(default_factory=lambda: [5e-5, 1e-4, 2e-4, 5e-4])
+    # PPO Ablations (tighter grid for stability)
+    ppo_kl_weight_values: List[float] = field(default_factory=lambda: [1e-4, 3e-4, 1e-3, 3e-3])
+    ppo_clip_values: List[float] = field(default_factory=lambda: [0.02, 0.05, 0.1])
+    ppo_lr_values: List[float] = field(default_factory=lambda: [1e-5, 2e-5, 5e-5, 1e-4])
     
     # Output
     output_dir: str = "ablation_results"
@@ -484,8 +484,10 @@ class MultiDimDDPM:
         self.device = torch.device(device)
         self.conditional = conditional
         
-        # Beta schedule
-        betas = torch.linspace(beta_start, beta_end, timesteps)
+        # Beta schedule - scale beta_end with timesteps (critical for 100 steps)
+        # beta_end=0.02 is typical for 1000 steps; scale down for fewer steps
+        scaled_beta_end = beta_end * (timesteps / 1000.0) if timesteps < 1000 else beta_end
+        betas = torch.linspace(beta_start, scaled_beta_end, timesteps)
         alphas = 1.0 - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         
@@ -503,12 +505,30 @@ class MultiDimDDPM:
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
     
     def register_schedule(self, betas, alphas, alphas_cumprod):
-        """Register diffusion schedule."""
+        """Register diffusion schedule with DDPM posterior coefficients."""
         self.betas = betas.to(self.device)
         self.alphas = alphas.to(self.device)
         self.alphas_cumprod = alphas_cumprod.to(self.device)
         self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod).to(self.device)
         self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod).to(self.device)
+        
+        # DDPM posterior coefficients (for unified reverse kernel)
+        # prev abar (with abar_prev[0] = 1)
+        abar_prev = torch.cat([torch.ones(1, device=self.device), self.alphas_cumprod[:-1]], dim=0)
+        self.alphas_cumprod_prev = abar_prev
+        
+        # DDPM posterior variance: beta_t * (1-abar_prev)/(1-abar_t)
+        self.posterior_variance = self.betas * (1.0 - abar_prev) / (1.0 - self.alphas_cumprod + 1e-8)
+        self.posterior_variance = torch.clamp(self.posterior_variance, min=1e-8)
+        self.posterior_log_variance_clipped = torch.log(self.posterior_variance)
+        
+        # posterior mean coefficients
+        self.posterior_mean_coef1 = (
+            self.betas * torch.sqrt(abar_prev) / (1.0 - self.alphas_cumprod + 1e-8)
+        )
+        self.posterior_mean_coef2 = (
+            (1.0 - abar_prev) * torch.sqrt(self.alphas) / (1.0 - self.alphas_cumprod + 1e-8)
+        )
     
     def q_sample(self, x0: torch.Tensor, t: torch.Tensor, noise: torch.Tensor = None) -> torch.Tensor:
         """Forward diffusion: q(x_t | x_0)"""
@@ -566,52 +586,27 @@ class MultiDimDDPM:
             if condition.shape[0] != num_samples:
                 condition = condition.repeat(num_samples, 1)
         
-        # Reverse diffusion
-        step_size = max(1, self.timesteps // max(1, num_steps))
-        
-        for i in reversed(range(0, self.timesteps, step_size)):
-            t = torch.full((num_samples,), i, device=self.device, dtype=torch.long)
+        # Reverse diffusion - use same kernel as PPO (DDPM posterior)
+        # IMPORTANT: for PPO correctness, do not skip steps (use all timesteps)
+        for t_int in reversed(range(self.timesteps)):
+            t = torch.full((num_samples,), t_int, device=self.device, dtype=torch.long)
             
             # Predict noise
             if self.conditional:
-                noise_pred = self.model(x, t, self.t_scale, condition)
+                eps = self.model(x, t, self.t_scale, condition)
             else:
-                noise_pred = self.model(x, t, self.t_scale)
+                eps = self.model(x, t, self.t_scale)
             
             # Clamp noise prediction to prevent explosion
-            noise_pred = torch.clamp(noise_pred, -10.0, 10.0)
+            eps = torch.clamp(eps, -10.0, 10.0)
             
-            # Compute alpha and beta
-            alpha_t = self.alphas[i]
-            alpha_cumprod_t = self.alphas_cumprod[i]
-            beta_t = self.betas[i]
+            # Use same p_mean_std() as PPO (unified kernel)
+            mean, std = self.p_mean_std(x, t, eps)
             
-            if i > 0:
-                alpha_cumprod_t_prev = self.alphas_cumprod[i - step_size] if i >= step_size else self.alphas_cumprod[0]
+            if t_int > 0:
+                x = mean + std * torch.randn_like(x)
             else:
-                alpha_cumprod_t_prev = torch.tensor(1.0, device=self.device)
-            
-            # Compute x_{t-1}
-            sqrt_alpha_t = torch.sqrt(alpha_t)
-            sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1.0 - alpha_cumprod_t)
-            sqrt_alpha_cumprod_t = torch.sqrt(alpha_cumprod_t)
-            
-            # Mean of p(x_{t-1} | x_t) - with numerical stability
-            pred_x0 = (x - sqrt_one_minus_alpha_cumprod_t * noise_pred) / (sqrt_alpha_cumprod_t + 1e-8)
-            
-            # Clamp predicted x0 to reasonable range
-            pred_x0 = torch.clamp(pred_x0, -50.0, 50.0)
-            
-            # Direction to x_t
-            dir_xt = torch.sqrt(1.0 - alpha_cumprod_t_prev) * noise_pred
-            
-            x = torch.sqrt(alpha_cumprod_t_prev) * pred_x0 + dir_xt
-            
-            # Add noise except at the last step
-            if i > 0:
-                noise = torch.randn_like(x)
-                sigma_t = torch.sqrt(beta_t)
-                x = x + sigma_t * noise
+                x = mean
             
             # Final clamp to prevent runaway values
             x = torch.clamp(x, -100.0, 100.0)
@@ -637,23 +632,24 @@ class MultiDimDDPM:
     @torch.no_grad()
     def p_mean_std(self, x_t: torch.Tensor, t: torch.Tensor, eps_pred: torch.Tensor):
         """
-        Reverse kernel p_theta(x_{t-1} | x_t, cond) assumed Gaussian with:
-          mean derived from eps_pred (DDPM)
-          std = sqrt(beta_t)
+        DDPM posterior reverse kernel p_theta(x_{t-1} | x_t, cond) using standard DDPM posterior.
+        This matches the kernel used in sample() for consistency.
         """
-        beta_t = self.betas[t].view(-1, 1)
-        alpha_t = self.alphas[t].view(-1, 1)
         abar_t = self.alphas_cumprod[t].view(-1, 1)
-
+        
         # x0 estimate from epsilon prediction
         x0_hat = (x_t - torch.sqrt(1.0 - abar_t) * eps_pred) / (torch.sqrt(abar_t) + 1e-8)
         x0_hat = torch.clamp(x0_hat, -50.0, 50.0)
 
-        # posterior mean for p(x_{t-1} | x_t, x0_hat)
-        # using the common DDPM parametrization via epsilon
-        mean = (1.0 / torch.sqrt(alpha_t)) * (x_t - (beta_t / (torch.sqrt(1.0 - abar_t) + 1e-8)) * eps_pred)
+        # DDPM posterior mean: coef1 * x0_hat + coef2 * x_t
+        coef1 = self.posterior_mean_coef1[t].view(-1, 1)
+        coef2 = self.posterior_mean_coef2[t].view(-1, 1)
+        mean = coef1 * x0_hat + coef2 * x_t
 
-        std = torch.sqrt(beta_t).clamp_min(1e-4)
+        # DDPM posterior variance
+        var = self.posterior_variance[t].view(-1, 1)
+        std = torch.sqrt(var)
+        
         return mean, std
 
 
@@ -735,22 +731,37 @@ class ESTrainer:
         # Get current parameters using vectorized utilities (CORRECT: preserves order)
         base_params = parameters_to_vector(self.ddpm.model.parameters()).detach()
         
+        # COMMON RANDOM NUMBERS: sample t and noise once, reuse for all candidates
+        # This dramatically reduces variance in ES gradient estimates
+        B = x_batch.shape[0]
+        t = torch.randint(0, self.ddpm.timesteps, (B,), device=self.device)
+        noise = torch.randn_like(x_batch)
+        x_t = self.ddpm.q_sample(x_batch, t, noise)
+        
         # Generate population with antithetic sampling (variance reduction)
         half_pop = max(1, self.population_size // 2)
-        noises = torch.randn(half_pop, base_params.numel(), device=self.device)
-        noises = torch.cat([noises, -noises], dim=0)  # Antithetic pairs
-        noises = noises[:self.population_size]  # Trim if odd
+        param_noises = torch.randn(half_pop, base_params.numel(), device=self.device)
+        param_noises = torch.cat([param_noises, -param_noises], dim=0)  # Antithetic pairs
+        param_noises = param_noises[:self.population_size]  # Trim if odd
         
-        # Evaluate fitness for each population member
+        # Evaluate fitness for each population member (using common t/noise/x_t)
         fitnesses = []
         losses = []
-        for i in range(noises.shape[0]):
+        for i in range(param_noises.shape[0]):
             # Set parameters
-            vec = base_params + self.sigma * noises[i]
+            vec = base_params + self.sigma * param_noises[i]
             vector_to_parameters(vec, self.ddpm.model.parameters())
             
-            # Compute fitness
-            fitness = self.compute_fitness(vec.cpu().numpy(), x_batch, y_batch)
+            # Compute fitness using COMMON random numbers (t, noise, x_t)
+            self.ddpm.model.eval()
+            with torch.no_grad():
+                if self.ddpm.conditional:
+                    eps_pred = self.ddpm.model(x_t, t, self.ddpm.t_scale, y_batch)
+                else:
+                    eps_pred = self.ddpm.model(x_t, t, self.ddpm.t_scale)
+                loss = ((eps_pred - noise) ** 2).mean()
+            
+            fitness = -loss.item()
             fitnesses.append(fitness)
             losses.append(-fitness)  # Convert back to actual loss
         
@@ -780,7 +791,7 @@ class ESTrainer:
         fit_tensor = (fit_tensor - fit_tensor.mean()) / (fit_tensor.std() + 1e-8)
         
         # Compute gradient estimate
-        grad = (fit_tensor.view(-1, 1) * noises).mean(dim=0) / (self.sigma + 1e-12)
+        grad = (fit_tensor.view(-1, 1) * param_noises).mean(dim=0) / (self.sigma + 1e-12)
         
         # Gradient clipping to prevent divergence
         grad_norm = torch.norm(grad)
@@ -977,7 +988,8 @@ class DDMECPPOTrainer:
         xs_prev = []
         old_logps = []
 
-        for t_int in reversed(range(self.actor.timesteps)):
+        # Exclude t=0 from PPO objective (deterministic transition, awkward logprob)
+        for t_int in reversed(range(1, self.actor.timesteps)):  # Start from 1, skip t=0
             t = torch.full((B,), t_int, device=self.device, dtype=torch.long)
             if self.actor.conditional:
                 eps = self.actor.model(x, t, self.actor.t_scale, y_cond)
@@ -985,12 +997,12 @@ class DDMECPPOTrainer:
                 eps = self.actor.model(x, t, self.actor.t_scale)
 
             mean, std = self.actor.p_mean_std(x, t, eps)
+            
+            # Clamp std to minimum for stability
+            std = std.clamp_min(1e-4)
 
-            if t_int > 0:
-                z = torch.randn_like(x)
-                x_prev = mean + std * z
-            else:
-                x_prev = mean
+            z = torch.randn_like(x)
+            x_prev = mean + std * z
 
             logp = _normal_logprob(x_prev, mean, std)
 
@@ -1000,6 +1012,9 @@ class DDMECPPOTrainer:
             old_logps.append(logp)
 
             x = x_prev
+        
+        # Final step: deterministic x_0 (not included in PPO objective)
+        # Just store final x for reward computation
 
         x0 = x
         return x0, xs_t, ts, xs_prev, old_logps
@@ -1022,18 +1037,19 @@ class DDMECPPOTrainer:
             adv = reward - self.reward_ema
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)  # normalize
 
-        # stack rollout buffers
+        # stack rollout buffers (note: t=0 excluded, so T = timesteps - 1)
+        num_transitions = len(xs_t)  # Should be timesteps - 1
         X_t = torch.cat(xs_t, dim=0)           # [T*B, dim]
         T_t = torch.cat(ts, dim=0)             # [T*B]
         X_prev = torch.cat(xs_prev, dim=0)     # [T*B, dim]
         OLD_LP = torch.cat(old_logps, dim=0)   # [T*B]
-        ADV = adv.repeat(self.actor.timesteps) # [T*B]
+        ADV = adv.repeat(num_transitions)      # [T*B] - repeat for each transition
 
         # 3) PPO epochs
         self.actor.model.train()
         for _ in range(self.ppo_epochs):
             if self.actor.conditional:
-                eps_new = self.actor.model(X_t, T_t, self.actor.t_scale, y_cond.repeat(self.actor.timesteps, 1))
+                eps_new = self.actor.model(X_t, T_t, self.actor.t_scale, y_cond.repeat(num_transitions, 1))
             else:
                 eps_new = self.actor.model(X_t, T_t, self.actor.t_scale)
             mean_new, std_new = self.actor.p_mean_std(X_t, T_t, eps_new)
@@ -2084,13 +2100,35 @@ Learned vs Target:
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close()
     
+    def _score_config(self, metrics: Dict) -> float:
+        """
+        Score configuration: lower is better.
+        Uses MAE (primary) + correlation/MI (secondary) with mild KL constraint.
+        This prevents selecting models that ignore conditioning (low KL but high MAE).
+        """
+        mae = metrics.get('mae', float('inf'))
+        kl = metrics.get('kl_div_total', float('inf'))
+        corr = metrics.get('correlation', 0.0)
+        mi = metrics.get('mutual_information', 0.0)
+        
+        # Penalize high MAE (coupling failure), high KL (marginal divergence)
+        # Reward high correlation and MI (coupling success)
+        score = (
+            3.0 * mae +                    # coupling accuracy (most important)
+            0.2 * kl -                     # keep marginals sane (mild constraint)
+            1.0 * corr -                   # reward coupling
+            0.2 * mi                       # reward mutual information
+        )
+        return score
+    
     def _generate_dimension_summary(self, dim: int):
         """Generate summary for a specific dimension."""
         results = self.all_results[dim]
         
-        # Find best configurations
-        best_es = min(results['ES'], key=lambda x: x['kl_div_total'])
-        best_ppo = min(results['PPO'], key=lambda x: x['kl_div_total'])
+        # Find best configurations using composite score (not just KL)
+        # KL alone can select models that ignore conditioning
+        best_es = min(results['ES'], key=self._score_config)
+        best_ppo = min(results['PPO'], key=self._score_config)
         
         summary_path = os.path.join(self.logs_dir, f"summary_{dim}d.txt")
         
@@ -2289,8 +2327,8 @@ Learned vs Target:
         
         # Best configs comparison
         ax9 = fig.add_subplot(gs[2, 2])
-        best_es = min(results['ES'], key=lambda x: x['kl_div_total'])
-        best_ppo = min(results['PPO'], key=lambda x: x['kl_div_total'])
+        best_es = min(results['ES'], key=self._score_config)
+        best_ppo = min(results['PPO'], key=self._score_config)
         
         metrics = ['kl_div_total', 'correlation', 'mae', 'mutual_information']
         es_vals = [best_es[m] for m in metrics]
@@ -2564,7 +2602,7 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
         # Best hyperparameters distribution - ES
         ax5 = fig.add_subplot(gs[1, 1])
         best_sigmas = [min(self.all_results[dim]['ES'], key=lambda x: x['kl_div_total'])['sigma'] for dim in dims]
-        best_es_lrs = [min(self.all_results[dim]['ES'], key=lambda x: x['kl_div_total'])['lr'] for dim in dims]
+        best_es_lrs = [min(self.all_results[dim]['ES'], key=self._score_config)['lr'] for dim in dims]
         
         ax5.scatter(best_sigmas, best_es_lrs, s=100, c=dims, cmap='viridis')
         ax5.set_xlabel('Best Sigma')
@@ -2577,7 +2615,7 @@ PPO Best Config (kl_w={best_ppo['kl_weight']}, clip={best_ppo['ppo_clip']}, lr={
         # Best hyperparameters distribution - PPO
         ax6 = fig.add_subplot(gs[1, 2])
         best_kl_weights = [min(self.all_results[dim]['PPO'], key=lambda x: x['kl_div_total'])['kl_weight'] for dim in dims]
-        best_ppo_lrs = [min(self.all_results[dim]['PPO'], key=lambda x: x['kl_div_total'])['lr'] for dim in dims]
+        best_ppo_lrs = [min(self.all_results[dim]['PPO'], key=self._score_config)['lr'] for dim in dims]
         
         ax6.scatter(best_kl_weights, best_ppo_lrs, s=100, c=dims, cmap='viridis')
         ax6.set_xlabel('Best KL Weight')
