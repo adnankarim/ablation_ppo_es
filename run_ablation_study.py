@@ -595,10 +595,26 @@ class MultiDimDDPM:
         # Start from noise
         x = torch.randn(num_samples, self.dim, device=self.device)
         
-        # Prepare condition
+        # Prepare condition safely (prevents memory blowup from unsafe repeat)
         if condition is not None:
-            if condition.shape[0] != num_samples:
+            if condition.dim() == 1:
+                condition = condition.unsqueeze(0)
+            
+            n_cond = int(condition.shape[0])
+            
+            # If a single conditioning vector is provided, broadcast it.
+            if n_cond == 1 and num_samples > 1:
                 condition = condition.repeat(num_samples, 1)
+            
+            # If we have per-sample conditioning, it must match num_samples.
+            elif n_cond != num_samples:
+                if n_cond > num_samples:
+                    # More conditions than samples: slice to match
+                    condition = condition[:num_samples]
+                else:
+                    # Fewer conditions than samples: tile to match
+                    reps = int(math.ceil(num_samples / n_cond))
+                    condition = condition.repeat(reps, 1)[:num_samples]
         
         # Reverse diffusion - use same kernel as PPO (DDPM posterior)
         # Note: num_steps can be used for faster evaluation, but PPO training uses full timesteps
@@ -1460,9 +1476,17 @@ class AblationRunner:
             # Init condition block
             if random_cond_init:
                 # Scale cond_scale with dimension for better signal in high dims
-                effective_scale = cond_scale * (1.0 if dim <= 10 else 1e-1)  # 1e-2 for dim>=20
+                # Higher dims need larger init scale to provide measurable conditional signal
+                if dim <= 10:
+                    mult = 1.0
+                elif dim <= 20:
+                    mult = 3.0
+                else:
+                    mult = 10.0  # makes 1e-3 -> 1e-2 for 30D
+                
+                effective_scale = cond_scale * mult
                 cond_L0.weight[:, dim:2*dim].normal_(mean=0.0, std=effective_scale)
-                print(f"    [SMART LOAD] Spliced random weights (scale={effective_scale:.1e}) for conditioning input")
+                print(f"    [SMART LOAD] Spliced random cond weights (scale={effective_scale:.1e})")
             else:
                 cond_L0.weight[:, dim:2*dim].zero_()
                 print(f"    [SMART LOAD] Spliced zero weights for conditioning input")
@@ -2043,17 +2067,18 @@ class AblationRunner:
         - Initial MI ~0.3-0.4 is acceptable (from pretrained model capability)
         - What matters is MI INCREASE during training (0.3 → 2.0+)
         """
-        num_eval = 1000
+        # If caller provided frozen eval sets, evaluate exactly on that size.
+        # CRITICAL: Must match provided set size to prevent memory blowup in sample()
+        if x1_true is not None and x2_true is not None:
+            assert x1_true.shape[0] == x2_true.shape[0], "x1_true/x2_true must have same N"
+            num_eval = int(x1_true.shape[0])
+        else:
+            # Generate new test set with appropriate size for dimension
+            num_eval = 5000 if dim >= 20 else 1000
+            x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
+            x2_true = x1_true + 8.0 + 0.1 * torch.randn_like(x1_true)  # Add noise for finite MI
         
         try:
-            # Use frozen test set if provided, otherwise generate new
-            if x1_true is None or x2_true is None:
-                # Generate test data with slight noise for MI to be finite
-                # Deterministic coupling (x2 = x1 + 8) makes MI infinite; add small noise
-                # Increase samples for high dims to stabilize MI estimation (30D needs more samples for 60D Gaussian)
-                num_eval = 5000 if dim >= 20 else 1000
-                x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
-                x2_true = x1_true + 8.0 + 0.1 * torch.randn_like(x1_true)  # Add noise for finite MI
             
             # Sample from conditional models with error handling
             # Always use proper conditioning (no shuffling)
