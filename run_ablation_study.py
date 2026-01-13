@@ -689,6 +689,9 @@ class MultiDimDDPM:
         """
         DDPM posterior reverse kernel p_theta(x_{t-1} | x_t, cond) using standard DDPM posterior.
         This matches the kernel used in sample() for consistency.
+        
+        SPECIAL CASE: t == 0 -> output x0_hat deterministically (no noise)
+        At t=0, we're already at the final step, so return x0_hat with zero std.
         """
         abar_t = self.alphas_cumprod[t].view(-1, 1)
         
@@ -696,14 +699,21 @@ class MultiDimDDPM:
         x0_hat = (x_t - torch.sqrt(1.0 - abar_t) * eps_pred) / (torch.sqrt(abar_t) + 1e-8)
         x0_hat = torch.clamp(x0_hat, -50.0, 50.0)
 
-        # DDPM posterior mean: coef1 * x0_hat + coef2 * x_t
+        # SPECIAL CASE: t == 0 -> output x0_hat deterministically
+        # At t=0, we're already at the final step, so return x0_hat with zero std
+        if torch.all(t == 0):
+            mean = x0_hat
+            std = torch.zeros_like(mean)  # deterministic
+            return mean, std
+
+        # DDPM posterior mean: coef1 * x0_hat + coef2 * x_t (for t > 0)
         coef1 = self.posterior_mean_coef1[t].view(-1, 1)
         coef2 = self.posterior_mean_coef2[t].view(-1, 1)
         mean = coef1 * x0_hat + coef2 * x_t
 
         # DDPM posterior variance
         var = self.posterior_variance[t].view(-1, 1)
-        std = torch.sqrt(var)
+        std = torch.sqrt(var).clamp_min(1e-8)
         
         return mean, std
 
@@ -998,7 +1008,9 @@ class ESTrainer:
             fitness = self.compute_fitness(vec, y_cond, seed=eval_seed)
             fitnesses.append(fitness)
             
-            # Also track components for logging
+            # Track components for logging (compute for base params once per step)
+            # Note: This is the reward/KL for the CURRENT actor (base params), not the population
+            # Population fitnesses are used for gradient estimation, but we log base params for clarity
             if i == 0:  # Only compute components once (for efficiency)
                 # Recompute with base params to get reward/KL (KL on rollout states X_t)
                 vector_to_parameters(base_params, self.actor.model.parameters())
@@ -1063,8 +1075,14 @@ class ESTrainer:
         vector_to_parameters(new_params, self.actor.model.parameters())
         self.actor.model.train()
         
+        # Return metrics: fitness stats from population, reward/KL from base params
         return {
-            'loss': float(-np.mean(fitnesses)),  # Negative fitness as "loss"
+            'loss': float(-np.mean(fitnesses)),  # Negative fitness as "loss" (from population)
+            'fitness_mean': float(np.mean(fitnesses)),  # Population fitness mean
+            'fitness_std': float(np.std(fitnesses)),  # Population fitness std
+            'reward_base': float(np.mean(rewards)) if rewards else 0.0,  # Reward for base params (logged)
+            'kl_base': float(np.mean(kls)) if kls else 0.0,  # KL for base params (logged)
+            # Legacy keys for compatibility
             'reward_mean': float(np.mean(rewards)) if rewards else 0.0,
             'kl_penalty': float(np.mean(kls)) if kls else 0.0,
         }
@@ -1821,12 +1839,18 @@ class AblationRunner:
         # Budget matching: ES uses N fitness evals per step, PPO uses U updates per epoch
         # For fairness, we match total rollout samples (not epochs)
         
+        # CRITICAL: Match rollout budget per epoch
+        # PPO: 1 rollout per update (per phase), so rollout_budget = ppo_updates_per_epoch
+        # ES: population_size rollouts per step, so num_es_steps = rollout_budget // pop_size
+        rollout_budget = self.config.ppo_updates_per_epoch  # PPO uses this many rollouts per epoch per phase
+        num_es_steps = max(1, rollout_budget // self.config.es_population_size)
+        
+        if True:  # Always print budget info
+            print(f"    [BUDGET] ES steps per epoch: {num_es_steps} (pop={self.config.es_population_size}, "
+                  f"rollout_budget={rollout_budget}, total_ES_rollouts={num_es_steps * self.config.es_population_size})")
+        
         for epoch in range(self.config.coupling_epochs):
             epoch_logs = []
-            
-            # Sample batches on-the-fly (like PPO) for budget matching
-            # Number of ES steps per epoch should match PPO updates per epoch
-            num_es_steps = self.config.ppo_updates_per_epoch  # Match PPO budget
             
             for step in range(num_es_steps):
                 # Sample unpaired marginals (same as PPO)
