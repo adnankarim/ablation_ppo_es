@@ -701,6 +701,21 @@ def _normal_logprob(x, mean, std):
     var = std * std
     return (-0.5 * ((x - mean) ** 2 / (var + 1e-8) + 2.0 * torch.log(std + 1e-8) + math.log(2 * math.pi))).sum(dim=-1)
 
+def _gaussian_kl_diag(mean_p, std_p, mean_q, std_q):
+    """
+    KL( N_p || N_q ) for diagonal Gaussians, per-sample.
+    
+    Returns KL divergence summed over dimensions (per-sample).
+    """
+    var_p = std_p.pow(2)
+    var_q = std_q.pow(2)
+    return 0.5 * (
+        (var_p / (var_q + 1e-8)) +
+        ((mean_q - mean_p).pow(2) / (var_q + 1e-8)) -
+        1.0 +
+        2.0 * (torch.log(std_q + 1e-8) - torch.log(std_p + 1e-8))
+    ).sum(dim=-1)
+
 
 # ============================================================================
 # ES TRAINER
@@ -749,7 +764,7 @@ class ESTrainer:
     
     @torch.no_grad()
     def _collect_rollout(self, y_cond: torch.Tensor):
-        """Collect rollout using current actor (same as PPO)."""
+        """Collect rollout using current actor (returns final x0 only, for reward)."""
         self.actor.model.eval()
         B = y_cond.shape[0]
         x = torch.randn(B, self.actor.dim, device=self.device)
@@ -771,6 +786,51 @@ class ESTrainer:
             x = x_prev
         
         return x  # Final x0
+    
+    @torch.no_grad()
+    def _collect_rollout_with_buffers(self, y_cond: torch.Tensor):
+        """
+        Collect rollout with state buffers (same as PPO).
+        
+        Returns:
+            x0: Final sample
+            X_t: Stacked rollout states [T*B, dim]
+            T_t: Stacked timesteps [T*B]
+        """
+        self.actor.model.eval()
+        B = y_cond.shape[0]
+        x = torch.randn(B, self.actor.dim, device=self.device)
+        
+        xs_t = []
+        ts = []
+        
+        # Rollout reverse diffusion chain (skip t=0, same as PPO)
+        for t_int in reversed(range(1, self.actor.timesteps)):
+            t = torch.full((B,), t_int, device=self.device, dtype=torch.long)
+            
+            if self.actor.conditional:
+                eps = self.actor.model(x, t, self.actor.t_scale, y_cond)
+            else:
+                eps = self.actor.model(x, t, self.actor.t_scale)
+            
+            mean, std = self.actor.p_mean_std(x, t, eps)
+            std = std.clamp_min(1e-4)
+            
+            z = torch.randn_like(x)
+            x_prev = mean + std * z
+            x_prev = torch.clamp(x_prev, -100.0, 100.0)  # Match PPO
+            
+            # Store state BEFORE transition (x is x_t, x_prev is x_{t-1})
+            xs_t.append(x)
+            ts.append(t)
+            
+            x = x_prev
+        
+        x0 = x
+        X_t = torch.cat(xs_t, dim=0)  # [T*B, dim]
+        T_t = torch.cat(ts, dim=0)     # [T*B]
+        
+        return x0, X_t, T_t
     
     @torch.no_grad()
     def _compute_reward(self, y_target: torch.Tensor, x_condition: torch.Tensor) -> torch.Tensor:
@@ -803,35 +863,45 @@ class ESTrainer:
         return r_pos - r_neg
     
     @torch.no_grad()
-    def _compute_kl_penalty(self, y_cond: torch.Tensor) -> float:
-        """Compute KL penalty to anchor (same as PPO)."""
-        # Sample a batch of rollouts to compute KL
+    def _compute_anchor_kl(self, X_t: torch.Tensor, T_t: torch.Tensor, y_cond: torch.Tensor) -> float:
+        """
+        Compute KL penalty to anchor on rollout states X_t (same as PPO).
+        
+        CRITICAL: Must compute KL on actual rollout states X_t, not on x0.
+        This matches PPO's KL computation exactly.
+        
+        Args:
+            X_t: Rollout states [T*B, dim]
+            T_t: Rollout timesteps [T*B]
+            y_cond: Conditioning variable [B, dim]
+        
+        Returns:
+            KL penalty (scalar)
+        """
         B = y_cond.shape[0]
-        x_gen = self._collect_rollout(y_cond)
+        T = X_t.shape[0] // B  # Number of transitions per sample
         
-        # Sample random timesteps for KL computation
-        t = torch.randint(1, self.actor.timesteps, (B,), device=self.device)
-        t_tensor = torch.full((B,), t[0].item(), device=self.device, dtype=torch.long)  # Use same t for all
+        # Repeat conditioning for each transition
+        y_rep = y_cond.repeat(T, 1)  # [T*B, dim]
         
-        # Get actor mean/std
+        # Actor stats (conditional)
         if self.actor.conditional:
-            eps_actor = self.actor.model(x_gen, t_tensor, self.actor.t_scale, y_cond)
+            eps_actor = self.actor.model(X_t, T_t, self.actor.t_scale, y_rep)
         else:
-            eps_actor = self.actor.model(x_gen, t_tensor, self.actor.t_scale)
-        mean_actor, std_actor = self.actor.p_mean_std(x_gen, t_tensor, eps_actor)
+            eps_actor = self.actor.model(X_t, T_t, self.actor.t_scale)
+        mean_actor, std_actor = self.actor.p_mean_std(X_t, T_t, eps_actor)
         std_actor = std_actor.clamp_min(1e-4)
         
-        # Get anchor mean/std
+        # Anchor stats (unconditional)
         if self.anchor.conditional:
-            eps_anchor = self.anchor.model(x_gen, t_tensor, self.anchor.t_scale, None)
+            eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale, None)
         else:
-            eps_anchor = self.anchor.model(x_gen, t_tensor, self.anchor.t_scale)
-        mean_anchor, std_anchor = self.anchor.p_mean_std(x_gen, t_tensor, eps_anchor)
+            eps_anchor = self.anchor.model(X_t, T_t, self.anchor.t_scale)
+        mean_anchor, std_anchor = self.anchor.p_mean_std(X_t, T_t, eps_anchor)
         std_anchor = std_anchor.clamp_min(1e-4)
         
-        # KL divergence (Gaussian approximation)
-        diff = mean_actor - mean_anchor
-        kl = 0.5 * ((diff / (std_anchor + 1e-8)) ** 2).mean()
+        # Full Gaussian KL (same formula as PPO)
+        kl = _gaussian_kl_diag(mean_actor, std_actor, mean_anchor, std_anchor).mean()
         
         return float(kl.item())
     
@@ -862,15 +932,15 @@ class ESTrainer:
         
         self.actor.model.eval()
         with torch.no_grad():
-            # Collect rollout
-            x_gen = self._collect_rollout(y_cond)
+            # Collect rollout with state buffers (for KL computation on X_t)
+            x0, X_t, T_t = self._collect_rollout_with_buffers(y_cond)
             
-            # Compute reward (contrastive)
-            reward = self._compute_reward(y_cond, x_gen)
+            # Compute reward (contrastive) on final x0
+            reward = self._compute_reward(y_cond, x0)
             reward_mean = reward.mean().item()
             
-            # Compute KL penalty
-            kl_penalty = self._compute_kl_penalty(y_cond)
+            # Compute KL penalty on rollout states X_t (CRITICAL: same as PPO)
+            kl_penalty = self._compute_anchor_kl(X_t, T_t, y_cond)
             
             # Fitness = reward - λ*KL (same as PPO objective)
             fitness = reward_mean - self.kl_coef * kl_penalty
@@ -1263,8 +1333,8 @@ class DDMECPPOTrainer:
             ppo_obj = torch.min(ratio * ADV, clipped * ADV).mean()
 
             # anchor constraint (uses cached anchor stats)
-            diff = mean_new - mean_anchor
-            anchor_kl = 0.5 * ((diff / (std_anchor + 1e-8)) ** 2).mean()
+            # Use full Gaussian KL (same formula as ES for fairness)
+            anchor_kl = _gaussian_kl_diag(mean_new, std_new, mean_anchor, std_anchor).mean()
 
             loss = -(ppo_obj) + self.kl_coef * anchor_kl
 
@@ -1749,7 +1819,8 @@ class AblationRunner:
                 for p in cond_x2.model.parameters():
                     p.requires_grad = True
                 
-                log_b = es_x2.train_step(y_cond=x1_batch, seed=seed)
+                # Use different seed for phase B (but deterministic)
+                log_b = es_x2.train_step(y_cond=x1_batch, seed=seed + 1000000)
                 
                 epoch_logs.append(0.5 * (log_a.get('reward_mean', 0.0) + log_b.get('reward_mean', 0.0)))
             
@@ -1902,7 +1973,9 @@ class AblationRunner:
                 for p in cond_x1.model.parameters():
                     p.requires_grad = True
                 
-                log_a = ppo_x1.train_step(y_cond=x2_batch)
+                # Use same seed pattern as ES for fairness
+                seed = epoch * 10000 + step
+                log_a = ppo_x1.train_step(y_cond=x2_batch, seed=seed)
                 
                 # -------------------------
                 # Phase B: update phi = P(X2|X1), scorer = theta fixed
@@ -1912,7 +1985,8 @@ class AblationRunner:
                 for p in cond_x2.model.parameters():
                     p.requires_grad = True
                 
-                log_b = ppo_x2.train_step(y_cond=x1_batch)
+                # Use different seed for phase B (but deterministic)
+                log_b = ppo_x2.train_step(y_cond=x1_batch, seed=seed + 1000000)
                 
                 epoch_logs.append(0.5 * (log_a["reward_mean"] + log_b["reward_mean"]))
             
