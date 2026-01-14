@@ -2307,9 +2307,13 @@ class AblationRunner:
                 # Denormalize if normalization was used
                 if dim in self.normalization_stats:
                     stats = self.normalization_stats[dim]
-                    test_samples_x1 = test_samples_x1_norm * stats['x1_std'] + stats['x1_mean']
+                    # Ensure both tensors are on CPU for denormalization
+                    test_samples_x1_norm_cpu = test_samples_x1_norm.cpu() if test_samples_x1_norm.is_cuda else test_samples_x1_norm
+                    x1_std_cpu = stats['x1_std'].cpu() if stats['x1_std'].is_cuda else stats['x1_std']
+                    x1_mean_cpu = stats['x1_mean'].cpu() if stats['x1_mean'].is_cuda else stats['x1_mean']
+                    test_samples_x1 = test_samples_x1_norm_cpu * x1_std_cpu + x1_mean_cpu
                 else:
-                    test_samples_x1 = test_samples_x1_norm
+                    test_samples_x1 = test_samples_x1_norm.cpu() if test_samples_x1_norm.is_cuda else test_samples_x1_norm
                 x1_final_mean = float(test_samples_x1.mean().item())
                 x1_final_std = float(test_samples_x1.std(unbiased=False).item())
             print(f"  [FINAL CHECK]")
@@ -2623,9 +2627,13 @@ class AblationRunner:
                 # Denormalize if normalization was used
                 if dim in self.normalization_stats:
                     stats = self.normalization_stats[dim]
-                    test_samples_x2 = test_samples_x2_norm * stats['x2_std'] + stats['x2_mean']
+                    # Ensure both tensors are on CPU for denormalization
+                    test_samples_x2_norm_cpu = test_samples_x2_norm.cpu() if test_samples_x2_norm.is_cuda else test_samples_x2_norm
+                    x2_std_cpu = stats['x2_std'].cpu() if stats['x2_std'].is_cuda else stats['x2_std']
+                    x2_mean_cpu = stats['x2_mean'].cpu() if stats['x2_mean'].is_cuda else stats['x2_mean']
+                    test_samples_x2 = test_samples_x2_norm_cpu * x2_std_cpu + x2_mean_cpu
                 else:
-                    test_samples_x2 = test_samples_x2_norm
+                    test_samples_x2 = test_samples_x2_norm.cpu() if test_samples_x2_norm.is_cuda else test_samples_x2_norm
                 x2_final_mean = float(test_samples_x2.mean().item())
                 x2_final_std = float(test_samples_x2.std(unbiased=False).item())
             print(f"  [FINAL CHECK]")
