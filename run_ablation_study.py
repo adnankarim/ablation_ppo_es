@@ -474,7 +474,7 @@ class MultiDimMLP(nn.Module):
         super().__init__()
         self.dim = dim
         
-        # Time embedding
+        # Time embedding with more capacity
         self.time_embed = nn.Sequential(
             nn.Linear(1, time_embed_dim),
             nn.SiLU(),
@@ -482,31 +482,47 @@ class MultiDimMLP(nn.Module):
             nn.SiLU(),
         )
         
-        # Main network
-        self.net = nn.Sequential(
-            nn.Linear(dim + time_embed_dim, hidden_dim),
-            nn.SiLU(),
+        # Main network with residual connections for better learning
+        self.input_proj = nn.Linear(dim + time_embed_dim, hidden_dim)
+        self.layer1 = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim),
         )
+        self.layer2 = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.layer3 = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        # Final output layer - initialized to help learn mean shifts
+        self.output = nn.Linear(hidden_dim, dim)
         
         # Better weight initialization for noise prediction
         self._initialize_weights()
     
     def _initialize_weights(self):
         """Initialize weights with better scaling for noise prediction."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                # Use Kaiming init for better gradient flow
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                if m.bias is not None:
+        # Initialize input projection
+        nn.init.kaiming_normal_(self.input_proj.weight, mode='fan_in', nonlinearity='relu')
+        nn.init.constant_(self.input_proj.bias, 0.0)
+        
+        # Initialize hidden layers
+        for layer in [self.layer1, self.layer2, self.layer3]:
+            for m in layer.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                     nn.init.constant_(m.bias, 0.0)
-                # Scale final layer output to have reasonable initial std
-                if m is self.net[-1]:  # Last layer
-                    nn.init.normal_(m.weight, mean=0.0, std=0.02)  # Smaller init for final layer
+        
+        # Initialize output layer with larger std to help learn mean shifts
+        # Use Xavier init for output to allow larger initial predictions
+        nn.init.xavier_normal_(self.output.weight, gain=0.1)
+        # Initialize bias to small random values (not zero) to break symmetry
+        nn.init.normal_(self.output.bias, mean=0.0, std=0.01)
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, t_scale: float, condition: torch.Tensor = None) -> torch.Tensor:
         # CRITICAL: Ensure t_norm matches model dtype (float32) to avoid dtype mismatch errors
@@ -515,7 +531,17 @@ class MultiDimMLP(nn.Module):
         t_norm = t_norm.to(self.time_embed[0].weight.dtype)
         t_emb = self.time_embed(t_norm)
         inp = torch.cat([x, t_emb], dim=-1)
-        return self.net(inp)
+        
+        # Project input
+        h = self.input_proj(inp)
+        
+        # Residual blocks with layer norm for stability
+        h = h + self.layer1(h)  # Residual connection
+        h = h + self.layer2(h)  # Residual connection
+        h = h + self.layer3(h)  # Residual connection
+        
+        # Final output
+        return self.output(h)
 
 
 class ConditionalMultiDimMLP(nn.Module):
@@ -525,7 +551,7 @@ class ConditionalMultiDimMLP(nn.Module):
         super().__init__()
         self.dim = dim
         
-        # Time embedding
+        # Time embedding with more capacity
         self.time_embed = nn.Sequential(
             nn.Linear(1, time_embed_dim),
             nn.SiLU(),
@@ -533,31 +559,47 @@ class ConditionalMultiDimMLP(nn.Module):
             nn.SiLU(),
         )
         
-        # Main network
-        self.net = nn.Sequential(
-            nn.Linear(2 * dim + time_embed_dim, hidden_dim),
-            nn.SiLU(),
+        # Main network with residual connections for better learning
+        self.input_proj = nn.Linear(2 * dim + time_embed_dim, hidden_dim)
+        self.layer1 = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
             nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, dim),
         )
+        self.layer2 = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        self.layer3 = nn.Sequential(
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.SiLU(),
+        )
+        # Final output layer - initialized to help learn mean shifts
+        self.output = nn.Linear(hidden_dim, dim)
         
         # Better weight initialization for noise prediction
         self._initialize_weights()
     
     def _initialize_weights(self):
         """Initialize weights with better scaling for noise prediction."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                # Use Kaiming init for better gradient flow
-                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                if m.bias is not None:
+        # Initialize input projection
+        nn.init.kaiming_normal_(self.input_proj.weight, mode='fan_in', nonlinearity='relu')
+        nn.init.constant_(self.input_proj.bias, 0.0)
+        
+        # Initialize hidden layers
+        for layer in [self.layer1, self.layer2, self.layer3]:
+            for m in layer.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
                     nn.init.constant_(m.bias, 0.0)
-                # Scale final layer output to have reasonable initial std
-                if m is self.net[-1]:  # Last layer
-                    nn.init.normal_(m.weight, mean=0.0, std=0.02)  # Smaller init for final layer
+        
+        # Initialize output layer with larger std to help learn mean shifts
+        # Use Xavier init for output to allow larger initial predictions
+        nn.init.xavier_normal_(self.output.weight, gain=0.1)
+        # Initialize bias to small random values (not zero) to break symmetry
+        nn.init.normal_(self.output.bias, mean=0.0, std=0.01)
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, t_scale: float, condition: torch.Tensor = None) -> torch.Tensor:
         # CRITICAL: Ensure t_norm matches model dtype (float32) to avoid dtype mismatch errors
@@ -570,7 +612,17 @@ class ConditionalMultiDimMLP(nn.Module):
             condition = torch.zeros_like(x)
         
         inp = torch.cat([x, condition, t_emb], dim=-1)
-        return self.net(inp)
+        
+        # Project input
+        h = self.input_proj(inp)
+        
+        # Residual blocks with layer norm for stability
+        h = h + self.layer1(h)  # Residual connection
+        h = h + self.layer2(h)  # Residual connection
+        h = h + self.layer3(h)  # Residual connection
+        
+        # Final output
+        return self.output(h)
 
 
 class MultiDimDDPM:
@@ -2077,7 +2129,8 @@ class AblationRunner:
                 test_samples_x1 = self._chunked_uncond_sample(ddpm_x1, 10000, ddpm_x1.timesteps, chunk_size=2048)
                 x1_final_mean = float(test_samples_x1.mean().item())
                 x1_final_std = float(test_samples_x1.std(unbiased=False).item())
-            print(f"  [FINAL CHECK] X1 mean/std: {x1_final_mean:.4f}, {x1_final_std:.4f} (target: 2.0, {np.sqrt(0.99):.4f})")
+            print(f"  [FINAL CHECK]")
+            print(f"  X1 mean/std: {x1_final_mean:.4f}, {x1_final_std:.4f} (target: 2.0, {np.sqrt(0.99):.4f})")
         
         # DDPM for X2
         if (self.config.reuse_pretrained and not self.config.retrain_ddpm and os.path.exists(model_x2_path)):
@@ -2237,7 +2290,8 @@ class AblationRunner:
                 test_samples_x2 = self._chunked_uncond_sample(ddpm_x2, 10000, ddpm_x2.timesteps, chunk_size=2048)
                 x2_final_mean = float(test_samples_x2.mean().item())
                 x2_final_std = float(test_samples_x2.std(unbiased=False).item())
-            print(f"  [FINAL CHECK] X2 mean/std: {x2_final_mean:.4f}, {x2_final_std:.4f} (target: 10.0, 1.0)")
+            print(f"  [FINAL CHECK]")
+            print(f"  X2 mean/std: {x2_final_mean:.4f}, {x2_final_std:.4f} (target: 10.0, 1.0)")
         
         return ddpm_x1, ddpm_x2
     
