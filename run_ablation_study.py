@@ -2011,6 +2011,18 @@ class AblationRunner:
             with torch.no_grad():
                 param_before = next(ddpm_x1.model.parameters()).clone()
             
+            # Track metrics over epochs for time-series plots
+            epoch_metrics_x1 = {
+                'epoch': [],
+                'loss': [],
+                'kl': [],
+                'mean_norm': [],
+                'std_norm': [],
+                'mean_denorm': [],
+                'std_denorm': [],
+                'noise_mse': [],
+            }
+            
             for epoch in range(self.config.ddpm_epochs):
                 losses = []
                 grad_norms = []
@@ -2152,11 +2164,19 @@ class AblationRunner:
                             wandb.log(
                                 {
                                     "pretrain_x1/loss": avg_loss,
-                                    "pretrain_x1/sample_mean": mean_val_norm,
-                                    "pretrain_x1/sample_std": std_val_norm,
-                                    "pretrain_x1/sample_var": var_val_norm,
+                                    "pretrain_x1/sample_mean_norm": mean_val_norm,
+                                    "pretrain_x1/sample_std_norm": std_val_norm,
+                                    "pretrain_x1/sample_var_norm": var_val_norm,
+                                    "pretrain_x1/sample_mean_denorm": mean_val_denorm,
+                                    "pretrain_x1/sample_std_denorm": std_val_denorm,
                                     "pretrain_x1/kl_to_target": kl_val,
+                                    "pretrain_x1/noise_pred_mean": eps_pred_mean,
+                                    "pretrain_x1/noise_pred_std": eps_pred_std,
+                                    "pretrain_x1/noise_target_mean": eps_target_mean,
+                                    "pretrain_x1/noise_target_std": eps_target_std,
                                     "pretrain_x1/noise_mse": eps_mse,
+                                    "pretrain_x1/real_data_mean_norm": real_mean,
+                                    "pretrain_x1/real_data_std_norm": real_std,
                                     "pretrain_x1/epoch": epoch + 1,
                                     "pretrain_x1/dim": dim,
                                 }
@@ -2198,6 +2218,83 @@ class AblationRunner:
                                 wandb.log({"pretrain_x1/sample_hist_plot": wandb.Image(hist_path)})
                         except Exception as e:
                             print(f"    [DDPM X1] Pretrain diagnostics plotting failed: {e}")
+                        
+                        # Store metrics for time-series plots
+                        epoch_metrics_x1['epoch'].append(epoch + 1)
+                        epoch_metrics_x1['loss'].append(avg_loss)
+                        epoch_metrics_x1['kl'].append(kl_val)
+                        epoch_metrics_x1['mean_norm'].append(mean_val_norm)
+                        epoch_metrics_x1['std_norm'].append(std_val_norm)
+                        epoch_metrics_x1['mean_denorm'].append(mean_val_denorm)
+                        epoch_metrics_x1['std_denorm'].append(std_val_denorm)
+                        epoch_metrics_x1['noise_mse'].append(eps_mse)
+                        
+                        # Create time-series plots periodically (every 20 epochs or at the end)
+                        if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
+                            try:
+                                pretrain_dir = os.path.join(self.plots_dir, f"pretrain_{dim}d")
+                                os.makedirs(pretrain_dir, exist_ok=True)
+                                ts_path = os.path.join(pretrain_dir, f"ddpm_x1_timeseries_epoch_{epoch+1}.png")
+                                
+                                fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+                                epochs_list = epoch_metrics_x1['epoch']
+                                
+                                # Loss
+                                axes[0, 0].plot(epochs_list, epoch_metrics_x1['loss'], 'b-', linewidth=2)
+                                axes[0, 0].set_xlabel('Epoch')
+                                axes[0, 0].set_ylabel('Loss')
+                                axes[0, 0].set_title('Training Loss')
+                                axes[0, 0].grid(True, alpha=0.3)
+                                
+                                # KL Divergence
+                                axes[0, 1].plot(epochs_list, epoch_metrics_x1['kl'], 'r-', linewidth=2)
+                                axes[0, 1].set_xlabel('Epoch')
+                                axes[0, 1].set_ylabel('KL Divergence')
+                                axes[0, 1].set_title('KL to Target (Normalized)')
+                                axes[0, 1].grid(True, alpha=0.3)
+                                
+                                # Mean (Normalized)
+                                axes[0, 2].plot(epochs_list, epoch_metrics_x1['mean_norm'], 'g-', linewidth=2, label='Generated')
+                                axes[0, 2].axhline(y=0.0, color='r', linestyle='--', label='Target')
+                                axes[0, 2].set_xlabel('Epoch')
+                                axes[0, 2].set_ylabel('Mean')
+                                axes[0, 2].set_title('Mean (Normalized)')
+                                axes[0, 2].legend()
+                                axes[0, 2].grid(True, alpha=0.3)
+                                
+                                # Std (Normalized)
+                                axes[1, 0].plot(epochs_list, epoch_metrics_x1['std_norm'], 'g-', linewidth=2, label='Generated')
+                                axes[1, 0].axhline(y=1.0, color='r', linestyle='--', label='Target')
+                                axes[1, 0].set_xlabel('Epoch')
+                                axes[1, 0].set_ylabel('Std')
+                                axes[1, 0].set_title('Std (Normalized)')
+                                axes[1, 0].legend()
+                                axes[1, 0].grid(True, alpha=0.3)
+                                
+                                # Mean (Denormalized)
+                                axes[1, 1].plot(epochs_list, epoch_metrics_x1['mean_denorm'], 'm-', linewidth=2, label='Generated')
+                                axes[1, 1].axhline(y=2.0, color='r', linestyle='--', label='Target')
+                                axes[1, 1].set_xlabel('Epoch')
+                                axes[1, 1].set_ylabel('Mean')
+                                axes[1, 1].set_title('Mean (Denormalized)')
+                                axes[1, 1].legend()
+                                axes[1, 1].grid(True, alpha=0.3)
+                                
+                                # Noise MSE
+                                axes[1, 2].plot(epochs_list, epoch_metrics_x1['noise_mse'], 'c-', linewidth=2)
+                                axes[1, 2].set_xlabel('Epoch')
+                                axes[1, 2].set_ylabel('MSE')
+                                axes[1, 2].set_title('Noise Prediction MSE')
+                                axes[1, 2].grid(True, alpha=0.3)
+                                
+                                plt.tight_layout()
+                                plt.savefig(ts_path, dpi=120, bbox_inches="tight")
+                                plt.close()
+                                
+                                if self.config.use_wandb and WANDB_AVAILABLE:
+                                    wandb.log({"pretrain_x1/timeseries_plot": wandb.Image(ts_path)})
+                            except Exception as e:
+                                print(f"    [DDPM X1] Time-series plotting failed: {e}")
                     except Exception as e:
                         print(f"    [DDPM X1] Pretrain diagnostics failed: {e}")
             
@@ -2272,6 +2369,18 @@ class AblationRunner:
             dataset = TensorDataset(x2_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
             
+            # Track metrics over epochs for time-series plots
+            epoch_metrics_x2 = {
+                'epoch': [],
+                'loss': [],
+                'kl': [],
+                'mean_norm': [],
+                'std_norm': [],
+                'mean_denorm': [],
+                'std_denorm': [],
+                'noise_mse': [],
+            }
+            
             for epoch in range(self.config.ddpm_epochs):
                 losses = []
                 for batch in dataloader:
@@ -2317,11 +2426,14 @@ class AblationRunner:
                         target_var2 = 1.0
                         kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu2, target_var2))
 
-                        # Console output with KL (show denormalized as primary)
+                        # Console output with KL + diagnostic stats
                         print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
                               f"KL: {kl_val:.6f}")
                         print(f"      Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 10.0, 1.0) [DENORM]")
                         print(f"      Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu2:.2f}, {target_std2:.4f}) [NORM]")
+                        print(f"      [DIAG] Real data (normalized): mean={real_mean:.4f}, std={real_std:.4f} | Generated (normalized): mean={mean_val:.4f}, std={std_val:.4f}")
+                        print(f"      [DIAG] Noise pred: mean={eps_pred_mean:.4f}, std={eps_pred_std:.4f} "
+                              f"(target: {eps_target_mean:.4f}, {eps_target_std:.4f}), MSE={eps_mse:.6f}")
 
                         # Optional noise prediction MSE (diagnostic only)
                         with torch.no_grad():
@@ -2336,15 +2448,51 @@ class AblationRunner:
                             else:
                                 noise_mse = float("nan")
 
+                        # Compute noise prediction stats for X2 (similar to X1)
+                        with torch.no_grad():
+                            test_batch_size = 100
+                            test_x0_raw = torch.randn(test_batch_size, dim, device=self.config.device) * 1.0 + 10.0
+                            # Normalize test_x0 to match training data distribution
+                            if dim in self.normalization_stats:
+                                stats = self.normalization_stats[dim]
+                                x2_mean_dev = stats['x2_mean'].to(self.config.device)
+                                x2_std_dev = stats['x2_std'].to(self.config.device)
+                                test_x0 = (test_x0_raw - x2_mean_dev) / x2_std_dev
+                            else:
+                                test_x0 = test_x0_raw
+                            test_t = torch.randint(0, ddpm_x2.timesteps, (test_batch_size,), device=self.config.device)
+                            test_noise = torch.randn_like(test_x0)
+                            test_x_t = ddpm_x2.q_sample(test_x0, test_t, test_noise)
+                            test_eps_pred = ddpm_x2.model(test_x_t, test_t, ddpm_x2.t_scale)
+                            eps_pred_mean = float(test_eps_pred.mean().item())
+                            eps_pred_std = float(test_eps_pred.std().item())
+                            eps_target_mean = float(test_noise.mean().item())
+                            eps_target_std = float(test_noise.std().item())
+                            eps_mse = float(nn.functional.mse_loss(test_eps_pred, test_noise).item())
+                        
+                        # Get real data stats for X2
+                        with torch.no_grad():
+                            real_batch = x2_data[torch.randint(0, len(x2_data), (1000,))]
+                            real_mean = float(real_batch.mean().item())
+                            real_std = float(real_batch.std(unbiased=False).item())
+
                         if self.config.use_wandb and WANDB_AVAILABLE:
                             wandb.log(
                                 {
                                     "pretrain_x2/loss": avg_loss,
-                                    "pretrain_x2/sample_mean": mean_val,
-                                    "pretrain_x2/sample_std": std_val,
-                                    "pretrain_x2/sample_var": var_val,
+                                    "pretrain_x2/sample_mean_norm": mean_val,
+                                    "pretrain_x2/sample_std_norm": std_val,
+                                    "pretrain_x2/sample_var_norm": var_val,
+                                    "pretrain_x2/sample_mean_denorm": mean_val_denorm,
+                                    "pretrain_x2/sample_std_denorm": std_val_denorm,
                                     "pretrain_x2/kl_to_target": kl_val,
-                                    "pretrain_x2/noise_mse": noise_mse,
+                                    "pretrain_x2/noise_pred_mean": eps_pred_mean,
+                                    "pretrain_x2/noise_pred_std": eps_pred_std,
+                                    "pretrain_x2/noise_target_mean": eps_target_mean,
+                                    "pretrain_x2/noise_target_std": eps_target_std,
+                                    "pretrain_x2/noise_mse": eps_mse,
+                                    "pretrain_x2/real_data_mean_norm": real_mean,
+                                    "pretrain_x2/real_data_std_norm": real_std,
                                     "pretrain_x2/epoch": epoch + 1,
                                     "pretrain_x2/dim": dim,
                                 }
@@ -2386,6 +2534,83 @@ class AblationRunner:
                                 wandb.log({"pretrain_x2/sample_hist_plot": wandb.Image(hist_path)})
                         except Exception as e:
                             print(f"    [DDPM X2] Pretrain diagnostics plotting failed: {e}")
+                        
+                        # Store metrics for time-series plots
+                        epoch_metrics_x2['epoch'].append(epoch + 1)
+                        epoch_metrics_x2['loss'].append(avg_loss)
+                        epoch_metrics_x2['kl'].append(kl_val)
+                        epoch_metrics_x2['mean_norm'].append(mean_val)
+                        epoch_metrics_x2['std_norm'].append(std_val)
+                        epoch_metrics_x2['mean_denorm'].append(mean_val_denorm)
+                        epoch_metrics_x2['std_denorm'].append(std_val_denorm)
+                        epoch_metrics_x2['noise_mse'].append(eps_mse)
+                        
+                        # Create time-series plots periodically (every 20 epochs or at the end)
+                        if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
+                            try:
+                                pretrain_dir = os.path.join(self.plots_dir, f"pretrain_{dim}d")
+                                os.makedirs(pretrain_dir, exist_ok=True)
+                                ts_path = os.path.join(pretrain_dir, f"ddpm_x2_timeseries_epoch_{epoch+1}.png")
+                                
+                                fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+                                epochs_list = epoch_metrics_x2['epoch']
+                                
+                                # Loss
+                                axes[0, 0].plot(epochs_list, epoch_metrics_x2['loss'], 'b-', linewidth=2)
+                                axes[0, 0].set_xlabel('Epoch')
+                                axes[0, 0].set_ylabel('Loss')
+                                axes[0, 0].set_title('Training Loss')
+                                axes[0, 0].grid(True, alpha=0.3)
+                                
+                                # KL Divergence
+                                axes[0, 1].plot(epochs_list, epoch_metrics_x2['kl'], 'r-', linewidth=2)
+                                axes[0, 1].set_xlabel('Epoch')
+                                axes[0, 1].set_ylabel('KL Divergence')
+                                axes[0, 1].set_title('KL to Target (Normalized)')
+                                axes[0, 1].grid(True, alpha=0.3)
+                                
+                                # Mean (Normalized)
+                                axes[0, 2].plot(epochs_list, epoch_metrics_x2['mean_norm'], 'g-', linewidth=2, label='Generated')
+                                axes[0, 2].axhline(y=0.0, color='r', linestyle='--', label='Target')
+                                axes[0, 2].set_xlabel('Epoch')
+                                axes[0, 2].set_ylabel('Mean')
+                                axes[0, 2].set_title('Mean (Normalized)')
+                                axes[0, 2].legend()
+                                axes[0, 2].grid(True, alpha=0.3)
+                                
+                                # Std (Normalized)
+                                axes[1, 0].plot(epochs_list, epoch_metrics_x2['std_norm'], 'g-', linewidth=2, label='Generated')
+                                axes[1, 0].axhline(y=1.0, color='r', linestyle='--', label='Target')
+                                axes[1, 0].set_xlabel('Epoch')
+                                axes[1, 0].set_ylabel('Std')
+                                axes[1, 0].set_title('Std (Normalized)')
+                                axes[1, 0].legend()
+                                axes[1, 0].grid(True, alpha=0.3)
+                                
+                                # Mean (Denormalized)
+                                axes[1, 1].plot(epochs_list, epoch_metrics_x2['mean_denorm'], 'm-', linewidth=2, label='Generated')
+                                axes[1, 1].axhline(y=10.0, color='r', linestyle='--', label='Target')
+                                axes[1, 1].set_xlabel('Epoch')
+                                axes[1, 1].set_ylabel('Mean')
+                                axes[1, 1].set_title('Mean (Denormalized)')
+                                axes[1, 1].legend()
+                                axes[1, 1].grid(True, alpha=0.3)
+                                
+                                # Noise MSE
+                                axes[1, 2].plot(epochs_list, epoch_metrics_x2['noise_mse'], 'c-', linewidth=2)
+                                axes[1, 2].set_xlabel('Epoch')
+                                axes[1, 2].set_ylabel('MSE')
+                                axes[1, 2].set_title('Noise Prediction MSE')
+                                axes[1, 2].grid(True, alpha=0.3)
+                                
+                                plt.tight_layout()
+                                plt.savefig(ts_path, dpi=120, bbox_inches="tight")
+                                plt.close()
+                                
+                                if self.config.use_wandb and WANDB_AVAILABLE:
+                                    wandb.log({"pretrain_x2/timeseries_plot": wandb.Image(ts_path)})
+                            except Exception as e:
+                                print(f"    [DDPM X2] Time-series plotting failed: {e}")
                     except Exception as e:
                         print(f"    [DDPM X2] Pretrain diagnostics failed: {e}")
             
