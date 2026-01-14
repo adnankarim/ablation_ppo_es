@@ -271,12 +271,26 @@ class InformationMetrics:
         
         # Marginal Entropies (use learned statistics, but with minimum std guard)
         # For multivariate Gaussian with diagonal covariance (independent dims)
-        # Fast mode: skip entropy computation (only needed for MI)
+        # Fast mode: skip expensive entropy/MI computation during training
         if fast:
-            h_x1 = 0.0
-            h_x2 = 0.0
-            h_x1_true = 0.0
-            h_x2_true = 0.0
+            # Use np.nan for expensive metrics (avoids fake "zero dips" in plots)
+            h_x1 = np.nan
+            h_x2 = np.nan
+            h_joint_21 = np.nan
+            h_joint_12 = np.nan
+            h_joint = np.nan
+            mutual_info = np.nan
+            mi_21 = np.nan
+            mi_12 = np.nan
+            mi_gen_gen = np.nan
+            h_x1_given_x2 = np.nan
+            h_x2_given_x1 = np.nan
+            
+            # Still define theoretical baselines cheaply (needed for return dict)
+            h_theoretical = InformationMetrics.entropy_multidim_gaussian(np.eye(dim) * (target_std ** 2))
+            h_x1_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * (np.sqrt(0.99) ** 2)))
+            h_x2_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * 1.0))
+            h_independent_joint = h_x1_true + h_x2_true
         else:
             h_x1 = InformationMetrics.entropy_multidim_gaussian(np.diag(std1_learned ** 2))
             h_x2 = InformationMetrics.entropy_multidim_gaussian(np.diag(std2_learned ** 2))
@@ -521,6 +535,7 @@ class MultiDimDDPM:
         lr: float = 1e-3,
         device: str = "cuda",
         conditional: bool = False,
+        create_optimizer: bool = True,  # Set False for PPO/ES (they use their own optimizers)
     ):
         self.dim = dim
         self.timesteps = timesteps
@@ -545,7 +560,10 @@ class MultiDimDDPM:
         else:
             self.model = MultiDimMLP(dim, hidden_dim).to(self.device)
         
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        # Only create optimizer if needed (PPO/ES use their own optimizers)
+        self.optimizer = None
+        if create_optimizer:
+            self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
     
     def register_schedule(self, betas, alphas, alphas_cumprod):
         """Register diffusion schedule with DDPM posterior coefficients."""
