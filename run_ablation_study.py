@@ -2041,7 +2041,8 @@ class AblationRunner:
                             num_samples = 5000
                             chunk_size = 1024 if dim <= 10 else 512
                             samples = self._chunked_uncond_sample(ddpm_x1, num_samples, ddpm_x1.timesteps, chunk_size=chunk_size)
-                            samples_cpu = samples.detach().cpu()
+                            # Explicitly move to CPU to avoid device mismatch
+                            samples_cpu = samples.detach().cpu().contiguous()
 
                         # Aggregate scalar stats over all dims/samples for easy plotting
                         mean_val_norm = float(samples_cpu.mean().item())
@@ -2049,10 +2050,16 @@ class AblationRunner:
                         std_val_norm = float(math.sqrt(max(var_val_norm, 0.0)))
                         
                         # Denormalize for display (show what it means in original space)
+                        # Ensure samples_cpu is on CPU and stats are on CPU
                         if dim in self.normalization_stats:
                             stats = self.normalization_stats[dim]
-                            mean_val_denorm = float((samples_cpu * stats['x1_std'] + stats['x1_mean']).mean().item())
-                            std_val_denorm = float((samples_cpu * stats['x1_std'] + stats['x1_mean']).std(unbiased=False).item())
+                            # Explicitly ensure both are on CPU
+                            samples_cpu_safe = samples_cpu.cpu() if samples_cpu.is_cuda else samples_cpu
+                            x1_std_cpu = stats['x1_std'].cpu() if stats['x1_std'].is_cuda else stats['x1_std']
+                            x1_mean_cpu = stats['x1_mean'].cpu() if stats['x1_mean'].is_cuda else stats['x1_mean']
+                            samples_denorm = samples_cpu_safe * x1_std_cpu + x1_mean_cpu
+                            mean_val_denorm = float(samples_denorm.mean().item())
+                            std_val_denorm = float(samples_denorm.std(unbiased=False).item())
                         else:
                             mean_val_denorm = mean_val_norm
                             std_val_denorm = std_val_norm
@@ -2062,10 +2069,12 @@ class AblationRunner:
                         with torch.no_grad():
                             # Generate normalized real data (same as training data)
                             real_batch_raw = torch.randn(min(1000, num_samples), dim, device=self.config.device) * np.sqrt(0.99) + 2.0
-                            # Normalize using stored stats
+                            # Normalize using stored stats (move stats to device for GPU operations)
                             if dim in self.normalization_stats:
                                 stats = self.normalization_stats[dim]
-                                real_batch = (real_batch_raw - stats['x1_mean']) / stats['x1_std']
+                                x1_mean_dev = stats['x1_mean'].to(self.config.device)
+                                x1_std_dev = stats['x1_std'].to(self.config.device)
+                                real_batch = (real_batch_raw - x1_mean_dev) / x1_std_dev
                             else:
                                 real_batch = real_batch_raw
                             real_mean = float(real_batch.mean().item())
@@ -2079,9 +2088,18 @@ class AblationRunner:
 
                         # DIAGNOSTIC: Check what the model is predicting during sampling
                         # Sample a small batch and check noise prediction quality
+                        # NOTE: Model was trained on normalized data, so we need to normalize test_x0
                         with torch.no_grad():
                             test_batch_size = 100
-                            test_x0 = torch.randn(test_batch_size, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
+                            test_x0_raw = torch.randn(test_batch_size, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
+                            # Normalize test_x0 to match training data distribution
+                            if dim in self.normalization_stats:
+                                stats = self.normalization_stats[dim]
+                                x1_mean_dev = stats['x1_mean'].to(self.config.device)
+                                x1_std_dev = stats['x1_std'].to(self.config.device)
+                                test_x0 = (test_x0_raw - x1_mean_dev) / x1_std_dev
+                            else:
+                                test_x0 = test_x0_raw
                             test_t = torch.randint(0, ddpm_x1.timesteps, (test_batch_size,), device=self.config.device)
                             test_noise = torch.randn_like(test_x0)
                             test_x_t = ddpm_x1.q_sample(test_x0, test_t, test_noise)
@@ -2093,23 +2111,26 @@ class AblationRunner:
                             eps_mse = float(nn.functional.mse_loss(test_eps_pred, test_noise).item())
                         
                         # Denormalize for display (show what it means in original space)
-                        # samples_cpu is on CPU, stats are on CPU, so this should work
+                        # Ensure samples_cpu is on CPU and stats are on CPU
                         if dim in self.normalization_stats:
                             stats = self.normalization_stats[dim]
-                            # Ensure both are on CPU (stats already are, samples_cpu should be)
-                            samples_denorm = samples_cpu * stats['x1_std'] + stats['x1_mean']
+                            # Explicitly ensure both are on CPU
+                            samples_cpu_safe = samples_cpu.cpu() if samples_cpu.is_cuda else samples_cpu
+                            x1_std_cpu = stats['x1_std'].cpu() if stats['x1_std'].is_cuda else stats['x1_std']
+                            x1_mean_cpu = stats['x1_mean'].cpu() if stats['x1_mean'].is_cuda else stats['x1_mean']
+                            samples_denorm = samples_cpu_safe * x1_std_cpu + x1_mean_cpu
                             mean_val_denorm = float(samples_denorm.mean().item())
                             std_val_denorm = float(samples_denorm.std(unbiased=False).item())
                         else:
-                            mean_val_denorm = mean_val
-                            std_val_denorm = std_val
+                            mean_val_denorm = mean_val_norm
+                            std_val_denorm = std_val_norm
                         
                         # Console output with KL + diagnostic stats
                         print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
                               f"KL: {kl_val:.6f}")
                         print(f"      Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 2.0, {np.sqrt(0.99):.4f}) [DENORM]")
-                        print(f"      Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu1:.2f}, {target_std1:.4f}) [NORM]")
-                        print(f"      [DIAG] Real data (normalized): mean={real_mean:.4f}, std={real_std:.4f} | Generated (normalized): mean={mean_val:.4f}, std={std_val:.4f}")
+                        print(f"      Mean: {mean_val_norm:.4f}, Std: {std_val_norm:.4f} (target: {target_mu1:.2f}, {target_std1:.4f}) [NORM]")
+                        print(f"      [DIAG] Real data (normalized): mean={real_mean:.4f}, std={real_std:.4f} | Generated (normalized): mean={mean_val_norm:.4f}, std={std_val_norm:.4f}")
                         print(f"      [DIAG] Noise pred: mean={eps_pred_mean:.4f}, std={eps_pred_std:.4f} "
                               f"(target: {eps_target_mean:.4f}, {eps_target_std:.4f}), MSE={eps_mse:.6f}")
 
@@ -2131,20 +2152,21 @@ class AblationRunner:
                             wandb.log(
                                 {
                                     "pretrain_x1/loss": avg_loss,
-                                    "pretrain_x1/sample_mean": mean_val,
-                                    "pretrain_x1/sample_std": std_val,
-                                    "pretrain_x1/sample_var": var_val,
+                                    "pretrain_x1/sample_mean": mean_val_norm,
+                                    "pretrain_x1/sample_std": std_val_norm,
+                                    "pretrain_x1/sample_var": var_val_norm,
                                     "pretrain_x1/kl_to_target": kl_val,
-                                    "pretrain_x1/noise_mse": noise_mse,
+                                    "pretrain_x1/noise_mse": eps_mse,
                                     "pretrain_x1/epoch": epoch + 1,
                                     "pretrain_x1/dim": dim,
                                 }
                             )
-                            # Histogram of samples
+                            # Histogram of samples (ensure on CPU before numpy conversion)
+                            samples_cpu_hist = samples_cpu.cpu() if samples_cpu.is_cuda else samples_cpu
                             wandb.log(
                                 {
                                     "pretrain_x1/sample_hist": wandb.Histogram(
-                                        samples_cpu.numpy().flatten()
+                                        samples_cpu_hist.numpy().flatten()
                                     )
                                 }
                             )
@@ -2157,8 +2179,10 @@ class AblationRunner:
                                 pretrain_dir, f"ddpm_x1_hist_epoch_{epoch+1}.png"
                             )
                             plt.figure()
+                            # Ensure on CPU before numpy conversion
+                            samples_cpu_hist = samples_cpu.cpu().contiguous() if samples_cpu.is_cuda else samples_cpu
                             plt.hist(
-                                samples_cpu.numpy().flatten(),
+                                samples_cpu_hist.numpy().flatten(),
                                 bins=100,
                                 density=True,
                                 alpha=0.8,
@@ -2276,10 +2300,11 @@ class AblationRunner:
                         # Ensure samples_cpu is on CPU and stats are on CPU
                         if dim in self.normalization_stats:
                             stats = self.normalization_stats[dim]
-                            # Both should be on CPU - ensure explicitly
+                            # Explicitly ensure both are on CPU
+                            samples_cpu_safe = samples_cpu.cpu() if samples_cpu.is_cuda else samples_cpu
                             x2_std_cpu = stats['x2_std'].cpu() if stats['x2_std'].is_cuda else stats['x2_std']
                             x2_mean_cpu = stats['x2_mean'].cpu() if stats['x2_mean'].is_cuda else stats['x2_mean']
-                            samples_denorm = samples_cpu.cpu() * x2_std_cpu + x2_mean_cpu
+                            samples_denorm = samples_cpu_safe * x2_std_cpu + x2_mean_cpu
                             mean_val_denorm = float(samples_denorm.mean().item())
                             std_val_denorm = float(samples_denorm.std(unbiased=False).item())
                         else:
@@ -2324,10 +2349,12 @@ class AblationRunner:
                                     "pretrain_x2/dim": dim,
                                 }
                             )
+                            # Histogram of samples (ensure on CPU before numpy conversion)
+                            samples_cpu_hist = samples_cpu.cpu().contiguous() if samples_cpu.is_cuda else samples_cpu
                             wandb.log(
                                 {
                                     "pretrain_x2/sample_hist": wandb.Histogram(
-                                        samples_cpu.numpy().flatten()
+                                        samples_cpu_hist.numpy().flatten()
                                     )
                                 }
                             )
@@ -2340,8 +2367,10 @@ class AblationRunner:
                                 pretrain_dir, f"ddpm_x2_hist_epoch_{epoch+1}.png"
                             )
                             plt.figure()
+                            # Ensure on CPU before numpy conversion
+                            samples_cpu_hist = samples_cpu.cpu().contiguous() if samples_cpu.is_cuda else samples_cpu
                             plt.hist(
-                                samples_cpu.numpy().flatten(),
+                                samples_cpu_hist.numpy().flatten(),
                                 bins=100,
                                 density=True,
                                 alpha=0.8,
