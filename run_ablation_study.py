@@ -327,12 +327,16 @@ class InformationMetrics:
         mae = (mae_21 + mae_12) / 2
         
         return {
+            'kl_x1_per_dim': float(kl_1),  # Average KL per dimension for X1 marginal
+            'kl_x2_per_dim': float(kl_2),  # Average KL per dimension for X2 marginal
+            'kl_marginals_per_dim_sum': float(kl_1 + kl_2),  # Sum of per-dim KLs across both marginals (NOT total KL)
+            # Legacy aliases for backward compatibility
             'kl_div_1': float(kl_1),
             'kl_div_2': float(kl_2),
-            'kl_div_1_per_dim': float(kl_1),  # Average KL per dimension for X1
-            'kl_div_2_per_dim': float(kl_2),  # Average KL per dimension for X2
-            'kl_per_dim_sum': float(kl_1 + kl_2),  # Sum of per-dim KLs across both marginals (NOT total KL)
-            'kl_div_total': float(kl_1 + kl_2),  # Legacy alias for backward compatibility
+            'kl_div_1_per_dim': float(kl_1),
+            'kl_div_2_per_dim': float(kl_2),
+            'kl_per_dim_sum': float(kl_1 + kl_2),
+            'kl_div_total': float(kl_1 + kl_2),
             'entropy_x1': float(h_x1),
             'entropy_x2': float(h_x2),
             'joint_entropy': float(h_joint),
@@ -629,16 +633,17 @@ class MultiDimDDPM:
                     condition = condition.repeat(reps, 1)[:num_samples]
         
         # Reverse diffusion - use same kernel as PPO (DDPM posterior)
+        # CRITICAL: Never include t=0 in sampling loop (matches PPO/ES rollouts which iterate t=T-1...1)
         # Note: num_steps can be used for faster evaluation, but PPO training uses full timesteps
         steps = min(int(num_steps), self.timesteps) if num_steps is not None else self.timesteps
         
-        # Build explicit timestep indices including endpoints (prevents skipping t=timesteps-1)
+        # Build explicit timestep indices (ONLY t >= 1, never t=0)
         if steps == self.timesteps:
-            # Full timesteps: use all
-            t_indices = list(reversed(range(self.timesteps)))
+            # Full timesteps: iterate from T-1 down to 1 (skip t=0)
+            t_indices = list(reversed(range(1, self.timesteps)))
         else:
-            # Reduced steps: use linspace to get evenly spaced indices including endpoints
-            t_indices = np.linspace(self.timesteps - 1, 0, steps).round().astype(int)
+            # Reduced steps: use linspace from T-1 down to 1 (end at 1, not 0)
+            t_indices = np.linspace(self.timesteps - 1, 1, steps).round().astype(int)
             t_indices = np.unique(t_indices)  # remove duplicates due to rounding
             t_indices = list(reversed(t_indices))  # reverse to go from high to low
         
@@ -665,10 +670,8 @@ class MultiDimDDPM:
             if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
                 return torch.zeros(num_samples, self.dim, device=self.device)
             
-            if t_int > 0:
-                x = mean + std * torch.randn_like(x)
-            else:
-                x = mean
+            # Sample next state (t_int is always >= 1 here, so always add noise)
+            x = mean + std * torch.randn_like(x)
             
             # Final clamp to prevent runaway values
             x = torch.clamp(x, -100.0, 100.0)
@@ -706,11 +709,14 @@ class MultiDimDDPM:
         DDPM posterior reverse kernel p_theta(x_{t-1} | x_t, cond) using standard DDPM posterior.
         This matches the kernel used in sample() for consistency.
         
-        SPECIAL CASE: t == 0 -> output x0_hat deterministically (no noise)
-        At t=0, we're already at the final step, so return x0_hat with zero std.
-        
-        CRITICAL: Handles mixed t tensors elementwise (safe for batched calls with mixed timesteps).
+        CRITICAL: This function should NEVER be called with t=0.
+        In DDPM, transitions are from x_t to x_{t-1} for t > 0 only.
+        Sampling/rollouts should iterate t = T-1 ... 1 (never include t=0).
         """
+        # Safety guard: t=0 should never appear in rollouts/sampling
+        if torch.any(t == 0):
+            raise RuntimeError("p_mean_std called with t==0; sampling/rollouts should only use t>=1.")
+        
         abar_t = self.alphas_cumprod[t].view(-1, 1)
         
         # x0 estimate from epsilon prediction
@@ -726,12 +732,6 @@ class MultiDimDDPM:
         var = self.posterior_variance[t].view(-1, 1)
         std = torch.sqrt(var).clamp_min(1e-8)
         
-        # SPECIAL CASE: t == 0 -> output x0_hat deterministically (elementwise for mixed batches)
-        # At t=0, we're already at the final step, so return x0_hat with zero std
-        t0 = (t == 0).view(-1, 1)
-        mean = torch.where(t0, x0_hat, mean)
-        std = torch.where(t0, torch.zeros_like(std), std)
-        
         return mean, std
 
 
@@ -739,11 +739,20 @@ class MultiDimDDPM:
 # HELPER FUNCTIONS FOR PPO
 # ============================================================================
 
-def _set_seed(seed: int):
-    """Unified seed setting for reproducibility (used by both PPO and ES)."""
+def _set_seed(seed: int, deterministic: bool = False):
+    """
+    Unified seed setting for reproducibility (used by both PPO and ES).
+    
+    Args:
+        seed: Random seed value
+        deterministic: If True, enable CUDNN deterministic mode (slower but bitwise reproducible)
+    """
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+        if deterministic:
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
     np.random.seed(seed % (2**32 - 1))
 
 def _normal_logprob(x, mean, std):
@@ -1360,7 +1369,9 @@ class DDMECPPOTrainer:
         T_t = torch.cat(ts, dim=0)             # [T*B]
         X_prev = torch.cat(xs_prev, dim=0)     # [T*B, dim]
         OLD_LP = torch.cat(old_logps, dim=0)   # [T*B]
-        ADV = adv.repeat(num_transitions)      # [T*B] - repeat for each transition
+        # CRITICAL: Scale advantage by 1/num_transitions to prevent early timesteps from dominating
+        # (since same scalar advantage is repeated for all transitions in a trajectory)
+        ADV = adv.repeat(num_transitions) / float(num_transitions)  # [T*B] - normalized per transition
 
         # Cache anchor stats once (they depend only on X_t, T_t which don't change during PPO epochs)
         # This saves repeated anchor forward passes (significant speedup)
@@ -1583,14 +1594,10 @@ class AblationRunner:
                         es_configs = [es_configs[self.config.es_config_idx]]
                         print(f"  [SELECT] Running only ES config {self.config.es_config_idx}: {es_configs[0]}")
                 
-                for i, (sigma, lr) in enumerate(es_configs):
-                    print(f"\n  ES Config {i+1}/{len(es_configs)}: sigma={sigma}, lr={lr}")
-                    result = self._run_es_experiment(
-                        dim, ddpm_x1, ddpm_x2, sigma, lr, i
-                    )
-                    result['sigma'] = sigma
-                    result['lr'] = lr
-                    dim_results['ES'].append(result)
+                es_results = self._run_es_experiment(
+                    dim, ddpm_x1, ddpm_x2, es_configs, eval_x1_true, eval_x2_true
+                )
+                dim_results['ES'] = es_results
             
             # PPO Ablations
             if hasattr(self.config, 'only_method') and self.config.only_method == "ES":
@@ -1618,15 +1625,10 @@ class AblationRunner:
                         ppo_configs = [ppo_configs[self.config.ppo_config_idx]]
                         print(f"  [SELECT] Running only PPO config {self.config.ppo_config_idx}: {ppo_configs[0]}")
                 
-                for i, (kl_weight, ppo_clip, lr) in enumerate(ppo_configs):
-                    print(f"\n  PPO Config {i+1}/{len(ppo_configs)}: kl_weight={kl_weight}, clip={ppo_clip}, lr={lr}")
-                    result = self._run_ppo_experiment(
-                        dim, ddpm_x1, ddpm_x2, kl_weight, ppo_clip, lr, i
-                    )
-                    result['kl_weight'] = kl_weight
-                    result['ppo_clip'] = ppo_clip
-                    result['lr'] = lr
-                    dim_results['PPO'].append(result)
+                ppo_results = self._run_ppo_experiment(
+                    dim, ddpm_x1, ddpm_x2, ppo_configs, eval_x1_true, eval_x2_true
+                )
+                dim_results['PPO'] = ppo_results
             
             # Store results
             self.all_results[dim] = dim_results
@@ -1752,9 +1754,32 @@ class AblationRunner:
         dim: int,
         ddpm_x1: MultiDimDDPM,
         ddpm_x2: MultiDimDDPM,
+        es_configs: List[Tuple[float, float]],
+        eval_x1_true: torch.Tensor,
+        eval_x2_true: torch.Tensor
+    ) -> List[Dict]:
+        """Run ES experiments for all configs (using shared frozen eval set)."""
+        results = []
+        
+        for config_idx, (sigma, lr) in enumerate(es_configs):
+            print(f"\n  ES Config {config_idx+1}/{len(es_configs)}: sigma={sigma}, lr={lr}")
+            result = self._run_single_es_experiment(
+                dim, ddpm_x1, ddpm_x2, sigma, lr, config_idx, eval_x1_true, eval_x2_true
+            )
+            results.append(result)
+        
+        return results
+    
+    def _run_single_es_experiment(
+        self,
+        dim: int,
+        ddpm_x1: MultiDimDDPM,
+        ddpm_x2: MultiDimDDPM,
         sigma: float,
         lr: float,
-        config_idx: int
+        config_idx: int,
+        eval_x1_true: torch.Tensor,
+        eval_x2_true: torch.Tensor
     ) -> Dict:
         """Run single ES experiment."""
         # Create checkpoint directory
@@ -1796,15 +1821,10 @@ class AblationRunner:
         
         # No dataloader needed - ES samples batches on-the-fly (like PPO)
         
-        # Initialize metrics tracking (includes warmup + ES training)
+        # Initialize metrics tracking
         epoch_metrics = []
         
-        # Generate frozen eval set for consistent evaluation across epochs
-        # Increase samples for high dims to stabilize MI estimation (30D needs more samples for 60D Gaussian)
-        num_eval = 5000 if dim >= 20 else 1000
-        eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
-        eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
-        
+        # Use provided frozen eval set (shared across all configs for fair comparison)
         # Evaluate INITIAL state (before any training)
         print(f"    Evaluating initial state...")
         initial_metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
@@ -1859,20 +1879,22 @@ class AblationRunner:
         # Budget matching: ES uses N fitness evals per step, PPO uses U updates per epoch
         # For fairness, we match total rollout samples (not epochs)
         
-        # CRITICAL: Match rollout budget per epoch
-        # PPO: 1 rollout per update (per phase), but also does ppo_epochs gradient steps per rollout
-        # For fairness in compute, account for PPO's inner epochs:
-        #   rollout_budget = ppo_updates_per_epoch * ppo_epochs (gradient steps)
-        # ES: population_size rollouts per step, so num_es_steps = rollout_budget // pop_size
-        # Alternative: match only rollouts (not gradient steps) by using rollout_budget = ppo_updates_per_epoch
-        ppo_epochs = 4  # Default PPO inner epochs (from DDMECPPOTrainer default)
-        rollout_budget = self.config.ppo_updates_per_epoch * ppo_epochs  # Match gradient steps (fairer)
-        num_es_steps = max(1, rollout_budget // self.config.es_population_size)
+        # CRITICAL: Match rollout budget per epoch (Option A: match number of rollouts)
+        # PPO: 2 phases per epoch (x1 phase + x2 phase), each phase does ppo_updates_per_epoch rollouts
+        #   Total PPO rollouts per epoch = 2 * ppo_updates_per_epoch
+        # ES: 2 phases per step (x1 phase + x2 phase), each phase does population_size rollouts
+        #   Total ES rollouts per step = 2 * population_size
+        # For fairness, match rollouts: ES_steps * (2 * pop_size) = 2 * ppo_updates_per_epoch
+        #   => ES_steps = ppo_updates_per_epoch / pop_size
+        num_es_steps = max(1, self.config.ppo_updates_per_epoch // self.config.es_population_size)
         
         if True:  # Always print budget info
+            ppo_rollouts_per_epoch = 2 * self.config.ppo_updates_per_epoch
+            es_rollouts_per_step = 2 * self.config.es_population_size
+            total_es_rollouts = num_es_steps * es_rollouts_per_step
             print(f"    [BUDGET] ES steps per epoch: {num_es_steps} (pop={self.config.es_population_size}, "
-                  f"rollout_budget={rollout_budget} [PPO_updates={self.config.ppo_updates_per_epoch} * ppo_epochs={ppo_epochs}], "
-                  f"total_ES_rollouts={num_es_steps * self.config.es_population_size})")
+                  f"PPO_rollouts/epoch={ppo_rollouts_per_epoch}, ES_rollouts/step={es_rollouts_per_step}, "
+                  f"total_ES_rollouts={total_es_rollouts})")
         
         for epoch in range(self.config.coupling_epochs):
             epoch_logs = []
@@ -1944,6 +1966,34 @@ class AblationRunner:
         ppo_clip: float,
         lr: float,
         config_idx: int
+    ) -> List[Dict]:
+        """Run PPO experiments for all configs (using shared frozen eval set)."""
+        results = []
+        
+        for config_idx, (kl_weight, ppo_clip, lr) in enumerate(ppo_configs):
+            print(f"\n  PPO Config {config_idx+1}/{len(ppo_configs)}: kl_weight={kl_weight:.1e}, clip={ppo_clip}, lr={lr}")
+            result = self._run_single_ppo_experiment(
+                dim, ddpm_x1, ddpm_x2, kl_weight, ppo_clip, lr, config_idx, eval_x1_true, eval_x2_true
+            )
+            result['kl_weight'] = kl_weight
+            result['ppo_clip'] = ppo_clip
+            result['lr'] = lr
+            result['phase'] = 'ppo'
+            results.append(result)
+        
+        return results
+    
+    def _run_single_ppo_experiment(
+        self,
+        dim: int,
+        ddpm_x1: MultiDimDDPM,
+        ddpm_x2: MultiDimDDPM,
+        kl_weight: float,
+        ppo_clip: float,
+        lr: float,
+        config_idx: int,
+        eval_x1_true: torch.Tensor,
+        eval_x2_true: torch.Tensor
     ) -> Dict:
         """Run single PPO experiment."""
         # Create checkpoint directory
