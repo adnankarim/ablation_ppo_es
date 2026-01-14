@@ -217,6 +217,8 @@ class InformationMetrics:
         target_mu1: float = 2.0,
         target_mu2: float = 10.0,
         target_std: float = 1.0,
+        target_std1: float = None,  # If None, use target_std for X1
+        target_std2: float = None,  # If None, use target_std for X2
         dim: int = 1,
         fast: bool = False,
     ) -> Dict[str, float]:
@@ -255,9 +257,15 @@ class InformationMetrics:
         std2_learned = np.maximum(std2_learned, 0.3)
         
         # Target statistics
+        # CRITICAL: Use separate target stds to match eval distribution
+        # x1_true ~ N(2, sqrt(0.99)), x2_true ~ N(10, 1.0)
+        target_std1 = target_std1 if target_std1 is not None else target_std
+        target_std2 = target_std2 if target_std2 is not None else target_std
+        
         mu1_target = np.full(dim, target_mu1)
         mu2_target = np.full(dim, target_mu2)
-        std_target = np.full(dim, target_std)
+        std1_target = np.full(dim, target_std1)
+        std2_target = np.full(dim, target_std2)
         
         # KL Divergences (per-dimension for fair comparison across dims)
         # NOTE: This measures marginal distribution quality P(X) vs target
@@ -266,8 +274,8 @@ class InformationMetrics:
         # KL may increase if: conditional model distorts marginal variance, sampling
         # instability dominates, or reward pushes "shortcut" solutions.
         # Use KL as a sanity check, not an expectation of increase.
-        kl_1 = InformationMetrics.kl_divergence_gaussian(mu1_learned, std1_learned, mu1_target, std_target, per_dimension=True)
-        kl_2 = InformationMetrics.kl_divergence_gaussian(mu2_learned, std2_learned, mu2_target, std_target, per_dimension=True)
+        kl_1 = InformationMetrics.kl_divergence_gaussian(mu1_learned, std1_learned, mu1_target, std1_target, per_dimension=True)
+        kl_2 = InformationMetrics.kl_divergence_gaussian(mu2_learned, std2_learned, mu2_target, std2_target, per_dimension=True)
         
         # Marginal Entropies (use learned statistics, but with minimum std guard)
         # For multivariate Gaussian with diagonal covariance (independent dims)
@@ -1079,6 +1087,11 @@ class ESTrainer:
             if i == 0:  # Only compute components once (for efficiency)
                 # Recompute with base params to get reward/KL (KL on rollout states X_t)
                 vector_to_parameters(base_params, self.actor.model.parameters())
+                # CRITICAL: Reset seed for base logging to ensure CRN alignment
+                # This makes ES logs less noisy and easier to compare to PPO
+                eval_seed = seed if seed is not None else None
+                if eval_seed is not None:
+                    _set_seed(eval_seed)
                 self.actor.model.eval()
                 with torch.no_grad():
                     x0, X_t, T_t = self._collect_rollout_with_buffers(y_cond)
@@ -1357,10 +1370,11 @@ class DDMECPPOTrainer:
 
             z = torch.randn_like(x)
             x_prev_raw = mean + std * z
-            # CRITICAL: Compute logp BEFORE clamp (logp is for the unclamped Gaussian)
-            # Clamp the state we carry forward, but logp must be for the actual sampled value
-            logp = _normal_logprob(x_prev_raw, mean, std)
             x_prev = torch.clamp(x_prev_raw, -100.0, 100.0)  # Clamp state for stability
+            # CRITICAL: Compute logp on CLAMPED value to match what we store/train on
+            # This ensures OLD_LP and NEW_LP are for the same "action" (clamped)
+            # Even though it's not a true truncated Gaussian, it's consistent with training
+            logp = _normal_logprob(x_prev, mean, std)
 
             xs_t.append(x)
             ts.append(t)
