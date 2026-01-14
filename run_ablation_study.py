@@ -270,8 +270,18 @@ class InformationMetrics:
         
         # Marginal Entropies (use learned statistics, but with minimum std guard)
         # For multivariate Gaussian with diagonal covariance (independent dims)
-        h_x1 = InformationMetrics.entropy_multidim_gaussian(np.diag(std1_learned ** 2))
-        h_x2 = InformationMetrics.entropy_multidim_gaussian(np.diag(std2_learned ** 2))
+        # Fast mode: skip entropy computation (only needed for MI)
+        if fast:
+            h_x1 = 0.0
+            h_x2 = 0.0
+            h_x1_true = 0.0
+            h_x2_true = 0.0
+        else:
+            h_x1 = InformationMetrics.entropy_multidim_gaussian(np.diag(std1_learned ** 2))
+            h_x2 = InformationMetrics.entropy_multidim_gaussian(np.diag(std2_learned ** 2))
+            # True marginal entropies (for MI computation)
+            h_x1_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * (np.sqrt(0.99) ** 2)))  # x1 std = sqrt(0.99)
+            h_x2_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * 1.0))  # x2 std = 1.0
         
         # Joint entropies for conditional quality (true -> generated)
         h_joint_21 = InformationMetrics.joint_entropy_from_samples(x2_true, x1_gen)
@@ -986,11 +996,9 @@ class ESTrainer:
         # Load parameters into model
         vector_to_parameters(params_vec, self.actor.model.parameters())
         
-        # Set seed for common random numbers (if provided)
+        # Set seed for common random numbers (if provided) - use unified _set_seed()
         if seed is not None:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed(seed)
+            _set_seed(seed)
         
         self.actor.model.eval()
         with torch.no_grad():
@@ -1317,6 +1325,9 @@ class DDMECPPOTrainer:
                 eps = self.actor.model(x, t, self.actor.t_scale, y_cond)
             else:
                 eps = self.actor.model(x, t, self.actor.t_scale)
+            
+            # CRITICAL: Clamp eps to match evaluation sampling (training = eval dynamics)
+            eps = torch.clamp(eps, -10.0, 10.0)
 
             mean, std = self.actor.p_mean_std(x, t, eps)
             
@@ -1593,7 +1604,10 @@ class AblationRunner:
             # CRITICAL: Create single frozen eval set per dimension (shared across all configs)
             # This ensures fair comparison - all configs evaluated on identical test data
             num_eval = 5000 if dim >= 20 else 1000
-            eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
+            # CRITICAL: Adjust x1 variance so x2 marginal has exactly std=1.0 (matches KL target)
+            # x2 = x1 + 8 + 0.1*noise, so Var(x2) = Var(x1) + 0.01
+            # For Var(x2) = 1.0, we need Var(x1) = 0.99, so std(x1) = sqrt(0.99)
+            eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
             eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
             print(f"  [EVAL] Created frozen eval set: {num_eval} samples (shared across all configs)")
             
@@ -1694,7 +1708,10 @@ class AblationRunner:
         """Pretrain DDPM models for X1 and X2."""
         # Check if models already exist in persistent directory
         # CRITICAL: Include timesteps and hidden_dim in filename to prevent cache collisions
-        tag = f"{dim}d_T{self.config.ddpm_timesteps}_H{self.config.ddpm_hidden_dim}"
+        # Extended tag includes beta schedule to prevent cache collisions
+        beta_start = 1e-4  # Default
+        beta_end_scaled = 0.02 * (self.config.ddpm_timesteps / 1000.0) if self.config.ddpm_timesteps < 1000 else 0.02
+        tag = f"{dim}d_T{self.config.ddpm_timesteps}_H{self.config.ddpm_hidden_dim}_b{beta_start:g}-{beta_end_scaled:g}"
         model_x1_path = os.path.join(self.pretrained_models_dir, f"ddpm_x1_{tag}.pt")
         model_x2_path = os.path.join(self.pretrained_models_dir, f"ddpm_x2_{tag}.pt")
         
@@ -1848,7 +1865,8 @@ class AblationRunner:
             hidden_dim=self.config.ddpm_hidden_dim,
             lr=lr,  # Use ES LR (no separate warmup phase needed)
             device=self.config.device,
-            conditional=True
+            conditional=True,
+            create_optimizer=False  # ES doesn't use MultiDimDDPM's optimizer
         )
         # Apply smart loading with RANDOM init for ES (same as PPO)
         self.smart_load_weights(cond_x2, ddpm_x2, dim, random_cond_init=True, cond_scale=1e-3)
@@ -1920,22 +1938,26 @@ class AblationRunner:
         # Budget matching: ES uses N fitness evals per step, PPO uses U updates per epoch
         # For fairness, we match total rollout samples (not epochs)
         
-        # CRITICAL: Match rollout budget per epoch (Option A: match number of rollouts)
-        # PPO: 2 phases per epoch (x1 phase + x2 phase), each phase does ppo_updates_per_epoch rollouts
-        #   Total PPO rollouts per epoch = 2 * ppo_updates_per_epoch
-        # ES: 2 phases per step (x1 phase + x2 phase), each phase does population_size rollouts
-        #   Total ES rollouts per step = 2 * population_size
-        # For fairness, match rollouts: ES_steps * (2 * pop_size) = 2 * ppo_updates_per_epoch
-        #   => ES_steps = ppo_updates_per_epoch / pop_size
-        num_es_steps = max(1, self.config.ppo_updates_per_epoch // self.config.es_population_size)
+        # CRITICAL: Match actor forward passes (fairer than just rollouts)
+        # PPO: 1 rollout + ppo_epochs forward passes over cached buffer per update
+        #   PPO cost per update ≈ 1 + ppo_epochs (rollout + repeated forward passes)
+        # ES: population_size rollouts per step (each rollout = T forward passes)
+        #   ES cost per step ≈ population_size
+        # For fairness: ES_steps * pop_size ≈ ppo_updates_per_epoch * (1 + ppo_epochs)
+        ppo_epochs = 4  # Default from DDMECPPOTrainer
+        ppo_cost = 1 + ppo_epochs  # rollout + repeated forward passes
+        es_cost = self.config.es_population_size
+        num_es_steps = max(1, int(round(self.config.ppo_updates_per_epoch * ppo_cost / es_cost)))
         
         if True:  # Always print budget info
             ppo_rollouts_per_epoch = 2 * self.config.ppo_updates_per_epoch
             es_rollouts_per_step = 2 * self.config.es_population_size
             total_es_rollouts = num_es_steps * es_rollouts_per_step
+            ppo_forward_passes = ppo_rollouts_per_epoch * ppo_cost
+            es_forward_passes = total_es_rollouts  # Each rollout = T forward passes
             print(f"    [BUDGET] ES steps per epoch: {num_es_steps} (pop={self.config.es_population_size}, "
-                  f"PPO_rollouts/epoch={ppo_rollouts_per_epoch}, ES_rollouts/step={es_rollouts_per_step}, "
-                  f"total_ES_rollouts={total_es_rollouts})")
+                  f"PPO_cost={ppo_cost}, ES_cost={es_cost}, "
+                  f"PPO_fwd_passes≈{ppo_forward_passes}, ES_fwd_passes≈{es_forward_passes})")
         
         for epoch in range(self.config.coupling_epochs):
             epoch_logs = []
@@ -1958,12 +1980,21 @@ class AblationRunner:
                 # Use different seed for phase B (but deterministic)
                 log_b = es_x2.train_step(y_cond=x1_batch, seed=seed + 1000000)
                 
-                epoch_logs.append(0.5 * (log_a.get('reward_mean', 0.0) + log_b.get('reward_mean', 0.0)))
+                # Log both fitness (population mean) and base reward/KL (actor actual)
+                # Use base reward for loss (consistent with actor objective)
+                epoch_logs.append({
+                    'fitness_mean': 0.5 * (log_a.get('fitness_mean', 0.0) + log_b.get('fitness_mean', 0.0)),
+                    'reward_base': 0.5 * (log_a.get('reward_base', 0.0) + log_b.get('reward_base', 0.0)),
+                    'kl_base': 0.5 * (log_a.get('kl_base', 0.0) + log_b.get('kl_base', 0.0)),
+                })
             
             # Evaluate coupling quality after both phases
-            metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
+            # Use fast mode during training (skip expensive MI/entropy), full eval at checkpoints
+            fast_eval = ((epoch + 1) % self.config.plot_every != 0) and ((epoch + 1) != self.config.coupling_epochs)
+            metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true, fast=fast_eval)
             metrics['epoch'] = epoch + 1
-            metrics['loss'] = float(-np.mean(epoch_logs))  # Higher reward => lower "loss" for plotting
+            # Use base reward for loss (consistent with actor objective, not population fitness)
+            metrics['loss'] = float(-np.mean([log.get('reward_base', 0.0) for log in epoch_logs]))
             metrics['sigma'] = sigma
             metrics['lr'] = lr
             metrics['phase'] = 'es'
@@ -2047,7 +2078,8 @@ class AblationRunner:
             hidden_dim=self.config.ddpm_hidden_dim,
             lr=lr,
             device=self.config.device,
-            conditional=True
+            conditional=True,
+            create_optimizer=False  # PPO uses DDMECPPOTrainer's optimizer
         )
         # Apply smart loading with RANDOM conditioning init for PPO bootstrapping
         # CRITICAL: Zero init makes scorer ignore condition → no reward signal → PPO can't learn
@@ -2060,7 +2092,8 @@ class AblationRunner:
             hidden_dim=self.config.ddpm_hidden_dim,
             lr=lr,
             device=self.config.device,
-            conditional=True
+            conditional=True,
+            create_optimizer=False  # PPO uses DDMECPPOTrainer's optimizer
         )
         # Apply smart loading with RANDOM conditioning init for PPO bootstrapping
         self.smart_load_weights(cond_x2, ddpm_x2, dim, random_cond_init=True, cond_scale=1e-3)
@@ -2188,7 +2221,7 @@ class AblationRunner:
     
     def _evaluate_coupling(self, dim: int, cond_x1: MultiDimDDPM, cond_x2: MultiDimDDPM, 
                           is_initial: bool = False, x1_true: torch.Tensor = None, 
-                          x2_true: torch.Tensor = None) -> Dict:
+                          x2_true: torch.Tensor = None, fast: bool = False) -> Dict:
         """
         Evaluate coupling quality with robust error handling.
         
