@@ -1835,8 +1835,6 @@ class AblationRunner:
                 
                 # Lightweight console logging
                 if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
-                    print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
-
                     # === Pretraining diagnostics: samples, stats, KL, histograms ===
                     try:
                         with torch.no_grad():
@@ -1855,6 +1853,10 @@ class AblationRunner:
                         target_std1 = math.sqrt(0.99)
                         target_var1 = target_std1 ** 2
                         kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu1, target_var1))
+
+                        # Console output with KL
+                        print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
+                              f"KL: {kl_val:.6f}, Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu1:.2f}, {target_std1:.4f})")
 
                         # Optional: noise prediction MSE on a held-out batch (diagnostic only)
                         with torch.no_grad():
@@ -1964,8 +1966,6 @@ class AblationRunner:
                 
                 # Lightweight console logging
                 if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
-                    print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
-
                     # === Pretraining diagnostics: samples, stats, KL, histograms ===
                     try:
                         with torch.no_grad():
@@ -1982,6 +1982,10 @@ class AblationRunner:
                         target_std2 = 1.0
                         target_var2 = target_std2 ** 2
                         kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu2, target_var2))
+
+                        # Console output with KL
+                        print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
+                              f"KL: {kl_val:.6f}, Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu2:.2f}, {target_std2:.4f})")
 
                         # Optional noise prediction MSE (diagnostic only)
                         with torch.no_grad():
