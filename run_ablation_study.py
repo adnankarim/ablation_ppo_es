@@ -412,7 +412,7 @@ class AblationConfig:
     dimensions: List[int] = field(default_factory=lambda: [1, 2, 5, 10, 20, 30])
     
     # DDPM pretraining (use pretrained models)
-    ddpm_epochs: int = 3000
+    ddpm_epochs: int = 100
     ddpm_lr: float = 1e-3  # Reduced from 2e-2 - high LR was causing instability (loss stuck at 1.0)
     ddpm_batch_size: int = 2048  # Increased for maximum memory usage
     ddpm_timesteps: int = 100  # Reduced from 1000 for PPO feasibility
@@ -4154,7 +4154,7 @@ def main():
     # Training parameters
     parser.add_argument("--coupling-epochs", type=int, default=20,
                        help="Number of epochs for coupling training (match config default)")
-    parser.add_argument("--ddpm-epochs", type=int, default=3000,
+    parser.add_argument("--ddpm-epochs", type=int, default=100,
                        help="Number of epochs for DDPM pretraining")
     parser.add_argument("--ddpm-num-samples", type=int, default=10000,
                        help="Number of synthetic samples used to pretrain each DDPM")
