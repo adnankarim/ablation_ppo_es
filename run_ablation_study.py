@@ -413,7 +413,7 @@ class AblationConfig:
     
     # DDPM pretraining (use pretrained models)
     ddpm_epochs: int = 3000
-    ddpm_lr: float = 2e-2  # Increased significantly to scale across dimensions
+    ddpm_lr: float = 1e-3  # Reduced from 2e-2 - high LR was causing instability (loss stuck at 1.0)
     ddpm_batch_size: int = 2048  # Increased for maximum memory usage
     ddpm_timesteps: int = 100  # Reduced from 1000 for PPO feasibility
     ddpm_hidden_dim: int = 512  # Increased model capacity to scale across dimensions
@@ -650,9 +650,19 @@ class MultiDimDDPM:
         # Backward
         self.optimizer.zero_grad()
         loss.backward()
+        # Gradient clipping for stability (less aggressive with lower LR)
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=10.0)
+        
+        # DIAGNOSTIC: Compute gradient norm before step (for debugging)
+        grad_norm = 0.0
+        for p in self.model.parameters():
+            if p.grad is not None:
+                grad_norm += p.grad.data.norm(2).item() ** 2
+        grad_norm = math.sqrt(grad_norm)
+        
         self.optimizer.step()
         
-        return loss.item()
+        return loss.item(), grad_norm
     
     @torch.no_grad()
     def sample(self, num_samples: int, condition: torch.Tensor = None, num_steps: int = None) -> torch.Tensor:
@@ -1627,6 +1637,27 @@ class AblationRunner:
                 cond_L0.weight[:, dim:2*dim].zero_()
                 print(f"    [SMART LOAD] Spliced zero weights for conditioning input")
     
+    @torch.no_grad()
+    def _chunked_cond_sample(
+        self,
+        model: MultiDimDDPM,
+        condition: torch.Tensor,
+        num_steps: int,
+        chunk_size: int = 4096,
+    ) -> torch.Tensor:
+        """
+        Sample model(num_samples=len(condition)) in chunks to avoid OOM.
+        Assumes condition is already [N, dim].
+        """
+        assert condition.dim() == 2, "condition must be [N, dim]"
+        N = int(condition.shape[0])
+        outs = []
+        for s in range(0, N, chunk_size):
+            c = condition[s:s + chunk_size]
+            out = model.sample(num_samples=int(c.shape[0]), condition=c, num_steps=num_steps)
+            outs.append(out)
+        return torch.cat(outs, dim=0)
+    
     def run(self):
         """Run the complete ablation study."""
         print("\n" + "="*80)
@@ -1661,7 +1692,8 @@ class AblationRunner:
             # CRITICAL: Create single frozen eval set per dimension (shared across all configs)
             # This ensures fair comparison - all configs evaluated on identical test data.
             # Use the SAME number of eval samples for every dimension for consistency.
-            num_eval = 50000  # Same across all dims
+            # Reduced from 50k to prevent OOM - chunked sampling handles large batches efficiently
+            num_eval = 10000 if dim >= 20 else 5000  # Balanced: enough for stable metrics, avoids OOM
             # CRITICAL: Adjust x1 variance so x2 marginal has exactly std=1.0 (matches KL target)
             # x2 = x1 + 8 + 0.1*noise, so Var(x2) = Var(x1) + 0.01
             # For Var(x2) = 1.0, we need Var(x1) = 0.99, so std(x1) = sqrt(0.99)
@@ -1782,11 +1814,13 @@ class AblationRunner:
             )
 
         # Check if models already exist in persistent directory
-        # CRITICAL: Include timesteps and hidden_dim in filename to prevent cache collisions
-        # Extended tag includes beta schedule to prevent cache collisions
+        # CRITICAL: Include timesteps, hidden_dim, lr, and epochs in filename to prevent cache collisions
+        # Extended tag includes beta schedule and hyperparameters to ensure retrain on hyperparameter changes
         beta_start = 1e-4  # Default
         beta_end_scaled = 0.02 * (self.config.ddpm_timesteps / 1000.0) if self.config.ddpm_timesteps < 1000 else 0.02
-        tag = f"{dim}d_T{self.config.ddpm_timesteps}_H{self.config.ddpm_hidden_dim}_b{beta_start:g}-{beta_end_scaled:g}"
+        # Include lr in tag so hyperparameter changes trigger retrain
+        lr_str = f"{self.config.ddpm_lr:.0e}".replace("e-0", "e-").replace("e+0", "e+")
+        tag = f"{dim}d_T{self.config.ddpm_timesteps}_H{self.config.ddpm_hidden_dim}_lr{lr_str}_E{self.config.ddpm_epochs}_b{beta_start:g}-{beta_end_scaled:g}"
         model_x1_path = os.path.join(self.pretrained_models_dir, f"ddpm_x1_{tag}.pt")
         model_x2_path = os.path.join(self.pretrained_models_dir, f"ddpm_x2_{tag}.pt")
         
@@ -1812,6 +1846,7 @@ class AblationRunner:
                 print(f"  [SKIP] Existing model found but --retrain-ddpm flag set. Training from scratch...")
             else:
                 print(f"  [TRAIN] No pretrained model found. Training DDPM X1...")
+                print(f"  [CONFIG] DDPM epochs: {self.config.ddpm_epochs}, LR: {self.config.ddpm_lr}, hidden_dim: {self.config.ddpm_hidden_dim}")
             
             ddpm_x1 = MultiDimDDPM(
                 dim=dim,
@@ -1825,12 +1860,28 @@ class AblationRunner:
             dataset = TensorDataset(x1_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
             
+            # DIAGNOSTIC: Check if parameters are updating
+            with torch.no_grad():
+                param_before = next(ddpm_x1.model.parameters()).clone()
+            
             for epoch in range(self.config.ddpm_epochs):
                 losses = []
+                grad_norms = []
+                
                 for batch in dataloader:
                     x = batch[0].to(self.config.device)
-                    loss = ddpm_x1.train_step(x)
+                    loss, grad_norm = ddpm_x1.train_step(x)
                     losses.append(loss)
+                    grad_norms.append(grad_norm)
+                
+                # DIAGNOSTIC: Check parameter update after first epoch
+                if epoch == 0:
+                    with torch.no_grad():
+                        param_after = next(ddpm_x1.model.parameters()).clone()
+                        param_delta = (param_after - param_before).abs().mean().item()
+                        avg_grad_norm = float(np.mean(grad_norms)) if grad_norms else 0.0
+                        print(f"      [DIAG] Parameter update: delta={param_delta:.8f} "
+                              f"(should be > 0 if training), avg_grad_norm={avg_grad_norm:.6f}")
                 
                 avg_loss = float(np.mean(losses)) if losses else float("nan")
                 
@@ -1849,15 +1900,42 @@ class AblationRunner:
                         var_val = float(samples_cpu.var(unbiased=False).item())
                         std_val = float(math.sqrt(max(var_val, 0.0)))
 
+                        # DIAGNOSTIC: Compare real data stats vs generated stats
+                        # Sample a batch from training data to verify target distribution
+                        # Generate fresh samples matching training distribution for comparison
+                        with torch.no_grad():
+                            real_batch = torch.randn(min(1000, num_samples), dim, device=self.config.device) * np.sqrt(0.99) + 2.0
+                            real_mean = float(real_batch.mean().item())
+                            real_std = float(real_batch.std(unbiased=False).item())
+
                         # Target for X1: N(2, sqrt(0.99)) to match eval distribution
                         target_mu1 = 2.0
                         target_std1 = math.sqrt(0.99)
                         target_var1 = target_std1 ** 2
                         kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu1, target_var1))
 
-                        # Console output with KL
+                        # DIAGNOSTIC: Check what the model is predicting during sampling
+                        # Sample a small batch and check noise prediction quality
+                        with torch.no_grad():
+                            test_batch_size = 100
+                            test_x0 = torch.randn(test_batch_size, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
+                            test_t = torch.randint(0, ddpm_x1.timesteps, (test_batch_size,), device=self.config.device)
+                            test_noise = torch.randn_like(test_x0)
+                            test_x_t = ddpm_x1.q_sample(test_x0, test_t, test_noise)
+                            test_eps_pred = ddpm_x1.model(test_x_t, test_t, ddpm_x1.t_scale)
+                            eps_pred_mean = float(test_eps_pred.mean().item())
+                            eps_pred_std = float(test_eps_pred.std().item())
+                            eps_target_mean = float(test_noise.mean().item())  # Should be ~0
+                            eps_target_std = float(test_noise.std().item())  # Should be ~1
+                            eps_mse = float(nn.functional.mse_loss(test_eps_pred, test_noise).item())
+                        
+                        # Console output with KL + diagnostic stats
                         print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
                               f"KL: {kl_val:.6f}, Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu1:.2f}, {target_std1:.4f})")
+                        print(f"      [DIAG] Real data: mean={real_mean:.4f}, std={real_std:.4f} | "
+                              f"Generated: mean={mean_val:.4f}, std={std_val:.4f}")
+                        print(f"      [DIAG] Noise pred: mean={eps_pred_mean:.4f}, std={eps_pred_std:.4f} "
+                              f"(target: {eps_target_mean:.4f}, {eps_target_std:.4f}), MSE={eps_mse:.6f}")
 
                         # Optional: noise prediction MSE on a held-out batch (diagnostic only)
                         with torch.no_grad():
@@ -1943,6 +2021,7 @@ class AblationRunner:
                 print(f"  [SKIP] Existing model found but --retrain-ddpm flag set. Training from scratch...")
             else:
                 print(f"  [TRAIN] No pretrained model found. Training DDPM X2...")
+                print(f"  [CONFIG] DDPM epochs: {self.config.ddpm_epochs}, LR: {self.config.ddpm_lr}, hidden_dim: {self.config.ddpm_hidden_dim}")
             
             ddpm_x2 = MultiDimDDPM(
                 dim=dim,
@@ -1960,7 +2039,7 @@ class AblationRunner:
                 losses = []
                 for batch in dataloader:
                     x = batch[0].to(self.config.device)
-                    loss = ddpm_x2.train_step(x)
+                    loss, _ = ddpm_x2.train_step(x)  # grad_norm not needed for X2 diagnostics
                     losses.append(loss)
                 
                 avg_loss = float(np.mean(losses)) if losses else float("nan")
@@ -2516,9 +2595,11 @@ class AblationRunner:
             
             # Sample from conditional models with error handling
             # Always use proper conditioning (no shuffling)
+            # Chunked sampling prevents OOM and keeps eval fair (same frozen eval set).
             with torch.no_grad():
-                x1_gen = cond_x1.sample(num_eval, x2_true, self.config.num_sampling_steps)
-                x2_gen = cond_x2.sample(num_eval, x1_true, self.config.num_sampling_steps)
+                chunk_size = 4096 if dim <= 10 else 2048
+                x1_gen = self._chunked_cond_sample(cond_x1, x2_true, self.config.num_sampling_steps, chunk_size=chunk_size)
+                x2_gen = self._chunked_cond_sample(cond_x2, x1_true, self.config.num_sampling_steps, chunk_size=chunk_size)
             
             # Convert to numpy
             x1_gen_np = x1_gen.cpu().numpy()
@@ -2818,8 +2899,9 @@ class AblationRunner:
         ax13.grid(True)
         
         ax14 = fig.add_subplot(gs[3, 1])
+        sigma1_target = float(np.sqrt(0.99))  # X1 target std = sqrt(0.99) to match eval distribution
         ax14.plot(epochs, [m['std1_learned'] for m in all_metrics], 'b-', linewidth=2, marker='o', label='σ1 learned', markersize=5)
-        ax14.axhline(y=1.0, color='b', linestyle='--', label='σ1 target (1.0)')
+        ax14.axhline(y=sigma1_target, color='b', linestyle='--', label=f'σ1 target ({sigma1_target:.4f})')
         ax14.plot(epochs, [m['std2_learned'] for m in all_metrics], 'r-', linewidth=2, marker='o', label='σ2 learned', markersize=5)
         ax14.axhline(y=1.0, color='r', linestyle='--', label='σ2 target (1.0)')
         if warmup_boundary is not None:
@@ -2860,7 +2942,7 @@ Information Theory:
 Learned vs Target:
   μ1: {latest['mu1_learned']:.3f} (target: 2.0)
   μ2: {latest['mu2_learned']:.3f} (target: 10.0)
-  σ1: {latest['std1_learned']:.3f} (target: 1.0)
+  σ1: {latest['std1_learned']:.3f} (target: {sigma1_target:.4f})
   σ2: {latest['std2_learned']:.3f} (target: 1.0)
         """
         ax15.text(0.1, 0.5, summary_text, fontsize=10, family='monospace',
@@ -3311,17 +3393,17 @@ Learned vs Target:
             stats_text = f"""
 ES Best Config (σ={best_es['sigma']}, lr={best_es['lr']}):
   μ1: {best_es['mu1_learned']:.3f} (target: 2.0)    μ2: {best_es['mu2_learned']:.3f} (target: 10.0)
-  σ1: {best_es['std1_learned']:.3f} (target: 1.0)    σ2: {best_es['std2_learned']:.3f} (target: 1.0)
+  σ1: {best_es['std1_learned']:.3f} (target: {np.sqrt(0.99):.4f})    σ2: {best_es['std2_learned']:.3f} (target: 1.0)
 
 PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, lr={best_ppo['lr']}):
   μ1: {best_ppo['mu1_learned']:.3f} (target: 2.0)    μ2: {best_ppo['mu2_learned']:.3f} (target: 10.0)
-  σ1: {best_ppo['std1_learned']:.3f} (target: 1.0)    σ2: {best_ppo['std2_learned']:.3f} (target: 1.0)
+  σ1: {best_ppo['std1_learned']:.3f} (target: {np.sqrt(0.99):.4f})    σ2: {best_ppo['std2_learned']:.3f} (target: 1.0)
             """
         elif has_es:
             stats_text = f"""
 ES Best Config (σ={best_es['sigma']}, lr={best_es['lr']}):
   μ1: {best_es['mu1_learned']:.3f} (target: 2.0)    μ2: {best_es['mu2_learned']:.3f} (target: 10.0)
-  σ1: {best_es['std1_learned']:.3f} (target: 1.0)    σ2: {best_es['std2_learned']:.3f} (target: 1.0)
+  σ1: {best_es['std1_learned']:.3f} (target: {np.sqrt(0.99):.4f})    σ2: {best_es['std2_learned']:.3f} (target: 1.0)
 
 PPO: (skipped --only-method ES)
             """
@@ -3331,7 +3413,7 @@ ES: (skipped --only-method PPO)
 
 PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, lr={best_ppo['lr']}):
   μ1: {best_ppo['mu1_learned']:.3f} (target: 2.0)    μ2: {best_ppo['mu2_learned']:.3f} (target: 10.0)
-  σ1: {best_ppo['std1_learned']:.3f} (target: 1.0)    σ2: {best_ppo['std2_learned']:.3f} (target: 1.0)
+  σ1: {best_ppo['std1_learned']:.3f} (target: {np.sqrt(0.99):.4f})    σ2: {best_ppo['std2_learned']:.3f} (target: 1.0)
             """
         else:
             stats_text = "\nNo methods run (both skipped)\n"
