@@ -412,17 +412,17 @@ class AblationConfig:
     dimensions: List[int] = field(default_factory=lambda: [1, 2, 5, 10, 20, 30])
     
     # DDPM pretraining (use pretrained models)
-    ddpm_epochs: int = 200
+    ddpm_epochs: int = 1000
     ddpm_lr: float = 1e-3
-    ddpm_batch_size: int = 128  # Increased from 64 for 2x speedup
+    ddpm_batch_size: int = 2048  # Increased for maximum memory usage
     ddpm_timesteps: int = 100  # Reduced from 1000 for PPO feasibility
     ddpm_hidden_dim: int = 128
-    ddpm_num_samples: int = 50000
+    ddpm_num_samples: int = 500000  # Increased for maximum memory usage
     
     # Coupling training
     coupling_epochs: int = 14
-    coupling_batch_size: int = 128  # Increased from 64 for 2x speedup
-    coupling_num_samples: int = 30000
+    coupling_batch_size: int = 2048  # Increased for maximum memory usage
+    coupling_num_samples: int = 300000  # Increased for maximum memory usage
     warmup_epochs: int = 15  # Increased for stability in high dimensions
     warmup_lr: float = 1e-4  # Fixed LR for warmup (separate from ES/PPO ablation LR)
     num_sampling_steps: int = 100
@@ -1659,8 +1659,9 @@ class AblationRunner:
             ddpm_x1, ddpm_x2 = self._pretrain_ddpm(dim)
             
             # CRITICAL: Create single frozen eval set per dimension (shared across all configs)
-            # This ensures fair comparison - all configs evaluated on identical test data
-            num_eval = 5000 if dim >= 20 else 1000
+            # This ensures fair comparison - all configs evaluated on identical test data.
+            # Use the SAME number of eval samples for every dimension for consistency.
+            num_eval = 50000  # Same across all dims
             # CRITICAL: Adjust x1 variance so x2 marginal has exactly std=1.0 (matches KL target)
             # x2 = x1 + 8 + 0.1*noise, so Var(x2) = Var(x1) + 0.01
             # For Var(x2) = 1.0, we need Var(x1) = 0.99, so std(x1) = sqrt(0.99)
@@ -1838,8 +1839,8 @@ class AblationRunner:
                     # === Pretraining diagnostics: samples, stats, KL, histograms ===
                     try:
                         with torch.no_grad():
-                            # Use smaller N in low dims, larger in high dims
-                            num_samples = 2000 if dim < 20 else 5000
+                            # Use the SAME number of diagnostic samples for every dimension
+                            num_samples = 50000
                             samples = ddpm_x1.sample(num_samples)
                             samples_cpu = samples.detach().cpu()
 
@@ -1969,7 +1970,8 @@ class AblationRunner:
                     # === Pretraining diagnostics: samples, stats, KL, histograms ===
                     try:
                         with torch.no_grad():
-                            num_samples = 2000 if dim < 20 else 5000
+                            # Use the SAME number of diagnostic samples for every dimension
+                            num_samples = 50000
                             samples = ddpm_x2.sample(num_samples)
                             samples_cpu = samples.detach().cpu()
 
@@ -3782,7 +3784,7 @@ def main():
     # Training parameters
     parser.add_argument("--coupling-epochs", type=int, default=14,
                        help="Number of epochs for coupling training (match config default)")
-    parser.add_argument("--ddpm-epochs", type=int, default=200,
+    parser.add_argument("--ddpm-epochs", type=int, default=1000,
                        help="Number of epochs for DDPM pretraining")
     parser.add_argument("--coupling-batch-size", type=int, default=128,
                        help="Batch size for coupling training")
