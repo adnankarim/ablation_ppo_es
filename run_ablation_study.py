@@ -2838,8 +2838,8 @@ class AblationRunner:
                 })
             
             # Evaluate coupling quality after both phases
-            # Use fast mode during training (skip expensive MI/entropy), full eval at checkpoints
-            fast_eval = ((epoch + 1) % self.config.plot_every != 0) and ((epoch + 1) != self.config.coupling_epochs)
+            # Use fast mode only at final epoch (full eval every epoch for plots)
+            fast_eval = ((epoch + 1) != self.config.coupling_epochs)
             metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true, fast=fast_eval)
             metrics['epoch'] = epoch + 1
             # Use actual objective (reward - λ*KL) for loss (consistent with actor optimization)
@@ -2852,9 +2852,8 @@ class AblationRunner:
             metrics['phase'] = 'es'
             epoch_metrics.append(metrics)
             
-            # Generate checkpoint plot (only every plot_every epochs to reduce IO)
-            if (epoch + 1) % self.config.plot_every == 0 or (epoch + 1) == self.config.coupling_epochs:
-                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', dim, f'σ={sigma}, lr={lr}')
+            # Generate checkpoint plot every epoch for better observability
+            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', dim, f'σ={sigma}, lr={lr}')
             
             # Log to wandb (include all key metrics)
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -3054,8 +3053,8 @@ class AblationRunner:
                 })
             
             # Evaluate coupling quality after both phases
-            # Use fast mode during training (skip expensive MI/entropy), full eval at checkpoints
-            fast_eval = ((epoch + 1) % self.config.plot_every != 0) and ((epoch + 1) != self.config.coupling_epochs)
+            # Use fast mode only at final epoch (full eval every epoch for plots)
+            fast_eval = ((epoch + 1) != self.config.coupling_epochs)
             metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true, fast=fast_eval)
             metrics['epoch'] = epoch + 1  # Epochs: 1, 2, 3... (epoch 0 is initial)
             # Use PPO objective for loss (consistent with actor objective)
@@ -3066,9 +3065,8 @@ class AblationRunner:
             metrics['phase'] = 'ppo'
             epoch_metrics.append(metrics)
             
-            # Generate checkpoint plot (only every plot_every epochs to reduce IO)
-            if (epoch + 1) % self.config.plot_every == 0 or (epoch + 1) == self.config.coupling_epochs:
-                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
+            # Generate checkpoint plot every epoch for better observability
+            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
             
             # Log to wandb (include all key metrics)
             if self.config.use_wandb and WANDB_AVAILABLE:
