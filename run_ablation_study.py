@@ -412,7 +412,7 @@ class AblationConfig:
     dimensions: List[int] = field(default_factory=lambda: [1, 2, 5, 10, 20, 30])
     
     # DDPM pretraining (use pretrained models)
-    ddpm_epochs: int = 1000
+    ddpm_epochs: int = 3000
     ddpm_lr: float = 1e-3
     ddpm_batch_size: int = 2048  # Increased for maximum memory usage
     ddpm_timesteps: int = 100  # Reduced from 1000 for PPO feasibility
@@ -3782,15 +3782,15 @@ def main():
                        help="Dimensions to test")
     
     # Training parameters
-    parser.add_argument("--coupling-epochs", type=int, default=14,
+    parser.add_argument("--coupling-epochs", type=int, default=20,
                        help="Number of epochs for coupling training (match config default)")
-    parser.add_argument("--ddpm-epochs", type=int, default=1000,
+    parser.add_argument("--ddpm-epochs", type=int, default=3000,
                        help="Number of epochs for DDPM pretraining")
-    parser.add_argument("--coupling-batch-size", type=int, default=128,
+    parser.add_argument("--coupling-batch-size", type=int, default=2048,
                        help="Batch size for coupling training")
     parser.add_argument("--ppo-updates-per-epoch", type=int, default=20,
                        help="Number of PPO updates per epoch")
-    parser.add_argument("--es-population-size", type=int, default=15,
+    parser.add_argument("--es-population-size", type=int, default=30,
                        help="Population size for Evolution Strategies")
     
     # ES ablation ranges (match AblationConfig defaults)
