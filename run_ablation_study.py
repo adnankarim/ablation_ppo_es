@@ -1011,7 +1011,9 @@ class ESTrainer:
         """
         self.actor.model.eval()
         B = y_cond.shape[0]
-        x = torch.randn(B, self.actor.dim, device=self.device)
+        # Ensure y_cond is float32 (model expects float32)
+        y_cond = y_cond.float() if y_cond.dtype != torch.float32 else y_cond
+        x = torch.randn(B, self.actor.dim, device=self.device, dtype=torch.float32)
         
         xs_t = []
         ts = []
@@ -1044,6 +1046,11 @@ class ESTrainer:
         x0 = x
         X_t = torch.cat(xs_t, dim=0)  # [T*B, dim]
         T_t = torch.cat(ts, dim=0)     # [T*B]
+        
+        # Ensure X_t is float32 (model weights are float32)
+        X_t = X_t.float()
+        # T_t is long for indexing, but ensure it's on the right device
+        T_t = T_t.to(self.device)
         
         return x0, X_t, T_t
     
@@ -3089,12 +3096,15 @@ class AblationRunner:
         # CRITICAL: Must match provided set size to prevent memory blowup in sample()
         if x1_true is not None and x2_true is not None:
             assert x1_true.shape[0] == x2_true.shape[0], "x1_true/x2_true must have same N"
+            # Ensure provided tensors are float32 and on correct device
+            x1_true = x1_true.float().to(self.config.device) if x1_true.dtype != torch.float32 or x1_true.device != self.config.device else x1_true
+            x2_true = x2_true.float().to(self.config.device) if x2_true.dtype != torch.float32 or x2_true.device != self.config.device else x2_true
             num_eval = int(x1_true.shape[0])
         else:
             # Generate new test set with appropriate size for dimension
             # CRITICAL: Match frozen eval set variance (x1 std=sqrt(0.99), x2 std=1.0)
             num_eval = 5000 if dim >= 20 else 1000
-            x1_true = torch.randn(num_eval, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
+            x1_true = torch.randn(num_eval, dim, device=self.config.device, dtype=torch.float32) * np.sqrt(0.99) + 2.0
             x2_true = x1_true + 8.0 + 0.1 * torch.randn_like(x1_true)  # Add noise for finite MI
         
         try:
@@ -3113,8 +3123,13 @@ class AblationRunner:
             # Must denormalize before comparing to true (unnormalized) data
             if dim in self.normalization_stats:
                 stats = self.normalization_stats[dim]
-                x1_gen = x1_gen_norm * stats['x1_std'] + stats['x1_mean']
-                x2_gen = x2_gen_norm * stats['x2_std'] + stats['x2_mean']
+                # Ensure stats are on the same device as generated samples
+                x1_std = stats['x1_std'].to(x1_gen_norm.device)
+                x1_mean = stats['x1_mean'].to(x1_gen_norm.device)
+                x2_std = stats['x2_std'].to(x2_gen_norm.device)
+                x2_mean = stats['x2_mean'].to(x2_gen_norm.device)
+                x1_gen = x1_gen_norm * x1_std + x1_mean
+                x2_gen = x2_gen_norm * x2_std + x2_mean
             else:
                 # Fallback: assume no normalization was used (for backward compatibility)
                 print(f"    [WARNING] No normalization stats found for dim={dim}, assuming unnormalized data")
