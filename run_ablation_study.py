@@ -739,6 +739,13 @@ class MultiDimDDPM:
 # HELPER FUNCTIONS FOR PPO
 # ============================================================================
 
+def _set_seed(seed: int):
+    """Unified seed setting for reproducibility (used by both PPO and ES)."""
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed % (2**32 - 1))
+
 def _normal_logprob(x, mean, std):
     """Diagonal Gaussian log p(x | mean, std)."""
     var = std * std
