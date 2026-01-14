@@ -2051,7 +2051,10 @@ class AblationRunner:
                 
                 avg_loss = float(np.mean(losses)) if losses else float("nan")
                 
-                # Lightweight console logging
+                # Print loss every epoch for observability
+                print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
+                
+                # Expensive diagnostics (sampling, KL, etc.) every 20 epochs or at the end
                 if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
                     # === Pretraining diagnostics: samples, stats, KL, histograms ===
                     try:
@@ -2401,7 +2404,10 @@ class AblationRunner:
                 
                 avg_loss = float(np.mean(losses)) if losses else float("nan")
                 
-                # Lightweight console logging
+                # Print loss every epoch for observability
+                print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
+                
+                # Expensive diagnostics (sampling, KL, etc.) every 20 epochs or at the end
                 if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
                     # === Pretraining diagnostics: samples, stats, KL, histograms ===
                     try:
