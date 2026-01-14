@@ -491,6 +491,21 @@ class MultiDimMLP(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, dim),
         )
+        
+        # Better weight initialization for noise prediction
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights with better scaling for noise prediction."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Use Kaiming init for better gradient flow
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+                # Scale final layer output to have reasonable initial std
+                if m is self.net[-1]:  # Last layer
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)  # Smaller init for final layer
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, t_scale: float, condition: torch.Tensor = None) -> torch.Tensor:
         # CRITICAL: Ensure t_norm matches model dtype (float32) to avoid dtype mismatch errors
@@ -527,6 +542,21 @@ class ConditionalMultiDimMLP(nn.Module):
             nn.SiLU(),
             nn.Linear(hidden_dim, dim),
         )
+        
+        # Better weight initialization for noise prediction
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize weights with better scaling for noise prediction."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Use Kaiming init for better gradient flow
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0.0)
+                # Scale final layer output to have reasonable initial std
+                if m is self.net[-1]:  # Last layer
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)  # Smaller init for final layer
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, t_scale: float, condition: torch.Tensor = None) -> torch.Tensor:
         # CRITICAL: Ensure t_norm matches model dtype (float32) to avoid dtype mismatch errors
