@@ -1955,12 +1955,12 @@ class AblationRunner:
         x2_mean = x2_raw.mean(dim=0, keepdim=True)
         x2_std = x2_raw.std(dim=0, keepdim=True) + 1e-8
         
-        # Store normalization stats for later denormalization
+        # Store normalization stats for later denormalization (move to CPU to avoid device mismatch)
         self.normalization_stats[dim] = {
-            'x1_mean': x1_mean,
-            'x1_std': x1_std,
-            'x2_mean': x2_mean,
-            'x2_std': x2_std
+            'x1_mean': x1_mean.cpu(),
+            'x1_std': x1_std.cpu(),
+            'x2_mean': x2_mean.cpu(),
+            'x2_std': x2_std.cpu()
         }
         
         # Normalize to N(0,1) - DDPMs work best with normalized data
@@ -2093,10 +2093,13 @@ class AblationRunner:
                             eps_mse = float(nn.functional.mse_loss(test_eps_pred, test_noise).item())
                         
                         # Denormalize for display (show what it means in original space)
+                        # samples_cpu is on CPU, stats are on CPU, so this should work
                         if dim in self.normalization_stats:
                             stats = self.normalization_stats[dim]
-                            mean_val_denorm = float((samples_cpu * stats['x1_std'] + stats['x1_mean']).mean().item())
-                            std_val_denorm = float((samples_cpu * stats['x1_std'] + stats['x1_mean']).std(unbiased=False).item())
+                            # Ensure both are on CPU (stats already are, samples_cpu should be)
+                            samples_denorm = samples_cpu * stats['x1_std'] + stats['x1_mean']
+                            mean_val_denorm = float(samples_denorm.mean().item())
+                            std_val_denorm = float(samples_denorm.std(unbiased=False).item())
                         else:
                             mean_val_denorm = mean_val
                             std_val_denorm = std_val
@@ -2104,8 +2107,8 @@ class AblationRunner:
                         # Console output with KL + diagnostic stats
                         print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
                               f"KL: {kl_val:.6f}")
-                        print(f"      [NORM] Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu1:.2f}, {target_std1:.4f})")
-                        print(f"      [DENORM] Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 2.0, {np.sqrt(0.99):.4f})")
+                        print(f"      Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 2.0, {np.sqrt(0.99):.4f}) [DENORM]")
+                        print(f"      Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu1:.2f}, {target_std1:.4f}) [NORM]")
                         print(f"      [DIAG] Real data (normalized): mean={real_mean:.4f}, std={real_std:.4f} | Generated (normalized): mean={mean_val:.4f}, std={std_val:.4f}")
                         print(f"      [DIAG] Noise pred: mean={eps_pred_mean:.4f}, std={eps_pred_std:.4f} "
                               f"(target: {eps_target_mean:.4f}, {eps_target_std:.4f}), MSE={eps_mse:.6f}")
@@ -2270,10 +2273,15 @@ class AblationRunner:
                         std_val = float(math.sqrt(max(var_val, 0.0)))
                         
                         # Denormalize for display (show what it means in original space)
+                        # Ensure samples_cpu is on CPU and stats are on CPU
                         if dim in self.normalization_stats:
                             stats = self.normalization_stats[dim]
-                            mean_val_denorm = float((samples_cpu * stats['x2_std'] + stats['x2_mean']).mean().item())
-                            std_val_denorm = float((samples_cpu * stats['x2_std'] + stats['x2_mean']).std(unbiased=False).item())
+                            # Both should be on CPU - ensure explicitly
+                            x2_std_cpu = stats['x2_std'].cpu() if stats['x2_std'].is_cuda else stats['x2_std']
+                            x2_mean_cpu = stats['x2_mean'].cpu() if stats['x2_mean'].is_cuda else stats['x2_mean']
+                            samples_denorm = samples_cpu.cpu() * x2_std_cpu + x2_mean_cpu
+                            mean_val_denorm = float(samples_denorm.mean().item())
+                            std_val_denorm = float(samples_denorm.std(unbiased=False).item())
                         else:
                             mean_val_denorm = mean_val
                             std_val_denorm = std_val
@@ -2284,11 +2292,11 @@ class AblationRunner:
                         target_var2 = 1.0
                         kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu2, target_var2))
 
-                        # Console output with KL
+                        # Console output with KL (show denormalized as primary)
                         print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
                               f"KL: {kl_val:.6f}")
-                        print(f"      [NORM] Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu2:.2f}, {target_std2:.4f})")
-                        print(f"      [DENORM] Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 10.0, 1.0)")
+                        print(f"      Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 10.0, 1.0) [DENORM]")
+                        print(f"      Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu2:.2f}, {target_std2:.4f}) [NORM]")
 
                         # Optional noise prediction MSE (diagnostic only)
                         with torch.no_grad():
