@@ -2860,8 +2860,8 @@ class AblationRunner:
                     f'ES/{dim}D/config_{config_idx}/mae': metrics['mae'],
                 })
             
-            if (epoch + 1) % 3 == 0:
-                print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
+            # Print every epoch for better observability
+            print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
             
             # Early stopping if ES diverges (100 per dim is very high)
             if metrics['kl_div_total'] > 100 or not np.isfinite(metrics['kl_div_total']):
@@ -3064,8 +3064,8 @@ class AblationRunner:
                     f'PPO/{dim}D/config_{config_idx}/mae': metrics['mae'],
                 })
             
-            if (epoch + 1) % 3 == 0:
-                print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
+            # Print every epoch for better observability
+            print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
         
         # Final evaluation
         final_metrics = epoch_metrics[-1]
