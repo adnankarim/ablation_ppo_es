@@ -1969,10 +1969,9 @@ class AblationRunner:
         dim: int,
         ddpm_x1: MultiDimDDPM,
         ddpm_x2: MultiDimDDPM,
-        kl_weight: float,
-        ppo_clip: float,
-        lr: float,
-        config_idx: int
+        ppo_configs: List[Tuple[float, float, float]],
+        eval_x1_true: torch.Tensor,
+        eval_x2_true: torch.Tensor
     ) -> List[Dict]:
         """Run PPO experiments for all configs (using shared frozen eval set)."""
         results = []
