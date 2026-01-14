@@ -645,6 +645,10 @@ class MultiDimDDPM:
             # Use same p_mean_std() as PPO (unified kernel)
             mean, std = self.p_mean_std(x, t, eps)
             
+            # CRITICAL: Clamp std to match training (PPO/ES rollout uses clamp_min(1e-4))
+            # This ensures evaluation sampling behaves the same as training
+            std = std.clamp_min(1e-4)
+            
             # Robustness check: if model blew up, return zeros
             if not torch.isfinite(mean).all() or not torch.isfinite(std).all():
                 return torch.zeros(num_samples, self.dim, device=self.device)
@@ -1840,9 +1844,13 @@ class AblationRunner:
         # For fairness, we match total rollout samples (not epochs)
         
         # CRITICAL: Match rollout budget per epoch
-        # PPO: 1 rollout per update (per phase), so rollout_budget = ppo_updates_per_epoch
+        # PPO: 1 rollout per update (per phase), but also does ppo_epochs gradient steps per rollout
+        # For fairness in compute, account for PPO's inner epochs:
+        #   rollout_budget = ppo_updates_per_epoch * ppo_epochs (gradient steps)
         # ES: population_size rollouts per step, so num_es_steps = rollout_budget // pop_size
-        rollout_budget = self.config.ppo_updates_per_epoch  # PPO uses this many rollouts per epoch per phase
+        # Alternative: match only rollouts (not gradient steps) by using rollout_budget = ppo_updates_per_epoch
+        ppo_epochs = 4  # Default PPO inner epochs (from DDMECPPOTrainer default)
+        rollout_budget = self.config.ppo_updates_per_epoch * ppo_epochs  # Match gradient steps (fairer)
         num_es_steps = max(1, rollout_budget // self.config.es_population_size)
         
         if True:  # Always print budget info
