@@ -370,13 +370,14 @@ class InformationMetrics:
             'kl_sum_per_dim': kl_sum_per_dim,  # Sum of per-dim KLs across both marginals (normalized)
             'kl_total_over_dims': kl_total_over_dims,  # Total KL over all dimensions (scales with dim)
             # Legacy aliases for backward compatibility
+            # NOTE: kl_div_total is actually kl_sum_per_dim (sum of per-dim KLs), NOT total over dims
             'kl_marginals_per_dim_sum': kl_sum_per_dim,
             'kl_div_1': float(kl_1),
             'kl_div_2': float(kl_2),
             'kl_div_1_per_dim': float(kl_1),
             'kl_div_2_per_dim': float(kl_2),
             'kl_per_dim_sum': kl_sum_per_dim,
-            'kl_div_total': kl_sum_per_dim,
+            'kl_div_total': kl_sum_per_dim,  # Alias for kl_sum_per_dim (sum of per-dim KLs, not total over dims)
             'entropy_x1': float(h_x1),
             'entropy_x2': float(h_x2),
             'joint_entropy': float(h_joint),
@@ -1064,7 +1065,9 @@ class ESTrainer:
         std_anchor = std_anchor.clamp_min(1e-4)
         
         # Full Gaussian KL (same formula as PPO)
+        # CRITICAL: Normalize by dimension to match reward scaling (reward is O(1), KL was O(dim))
         kl = _gaussian_kl_diag(mean_actor, std_actor, mean_anchor, std_anchor).mean()
+        kl = kl / float(self.actor.dim)  # Normalize to per-dimension for fair cross-dim comparison
         
         return float(kl.item())
     
@@ -1525,7 +1528,9 @@ class DDMECPPOTrainer:
 
             # anchor constraint (uses cached anchor stats)
             # Use full Gaussian KL (same formula as ES for fairness)
+            # CRITICAL: Normalize by dimension to match reward scaling (reward is O(1), KL was O(dim))
             anchor_kl = _gaussian_kl_diag(mean_new, std_new, mean_anchor, std_anchor).mean()
+            anchor_kl = anchor_kl / float(self.actor.dim)  # Normalize to per-dimension for fair cross-dim comparison
 
             loss = -(ppo_obj) + self.kl_coef * anchor_kl
 
@@ -1688,6 +1693,24 @@ class AblationRunner:
             outs.append(out)
         return torch.cat(outs, dim=0)
     
+    @torch.no_grad()
+    def _chunked_uncond_sample(
+        self,
+        model: MultiDimDDPM,
+        num_samples: int,
+        num_steps: int,
+        chunk_size: int = 4096,
+    ) -> torch.Tensor:
+        """
+        Sample model(num_samples) unconditionally in chunks to avoid OOM.
+        """
+        outs = []
+        for s in range(0, num_samples, chunk_size):
+            n = min(chunk_size, num_samples - s)
+            out = model.sample(num_samples=n, condition=None, num_steps=num_steps)
+            outs.append(out)
+        return torch.cat(outs, dim=0)
+    
     def run(self):
         """Run the complete ablation study."""
         print("\n" + "="*80)
@@ -1824,6 +1847,15 @@ class AblationRunner:
         if self.config.use_wandb and WANDB_AVAILABLE:
             wandb.finish()
     
+    @torch.no_grad()
+    def _denormalize(self, x_norm: torch.Tensor, data_mean: float, data_std: float) -> torch.Tensor:
+        """
+        Denormalize samples from normalized space to real space.
+        Note: This codebase doesn't use normalization (data is in real space),
+        but this helper is provided for clarity and future-proofing.
+        """
+        return x_norm * data_std + data_mean
+    
     def _pretrain_ddpm(self, dim: int) -> Tuple[MultiDimDDPM, MultiDimDDPM]:
         """Pretrain DDPM models for X1 and X2."""
         # Helper: closed-form 1D Gaussian KL for diagnostics during pretraining
@@ -1887,6 +1919,11 @@ class AblationRunner:
                 conditional=False
             )
             
+            # DIAGNOSTIC: Verify X1 data stats
+            x1_real_mean = float(x1_data.mean().item())
+            x1_real_std = float(x1_data.std(unbiased=False).item())
+            print(f"  [REAL X1] mean={x1_real_mean:.4f}, std={x1_real_std:.4f} (target: 2.0, {np.sqrt(0.99):.4f})")
+            
             dataset = TensorDataset(x1_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
             
@@ -1920,9 +1957,10 @@ class AblationRunner:
                     # === Pretraining diagnostics: samples, stats, KL, histograms ===
                     try:
                         with torch.no_grad():
-                            # Use the SAME number of diagnostic samples for every dimension
-                            num_samples = 50000
-                            samples = ddpm_x1.sample(num_samples)
+                            # Reduced diagnostic samples to prevent OOM/timeout (5k is enough for mean/std/KL)
+                            num_samples = 5000
+                            chunk_size = 1024 if dim <= 10 else 512
+                            samples = self._chunked_uncond_sample(ddpm_x1, num_samples, ddpm_x1.timesteps, chunk_size=chunk_size)
                             samples_cpu = samples.detach().cpu()
 
                         # Aggregate scalar stats over all dims/samples for easy plotting
@@ -2033,6 +2071,13 @@ class AblationRunner:
             
             ddpm_x1.save(model_x1_path)
             print(f"  [SAVE] Saved DDPM X1 to {model_x1_path}")
+            
+            # DIAGNOSTIC: End-to-end truth test for X1
+            with torch.no_grad():
+                test_samples_x1 = self._chunked_uncond_sample(ddpm_x1, 10000, ddpm_x1.timesteps, chunk_size=2048)
+                x1_final_mean = float(test_samples_x1.mean().item())
+                x1_final_std = float(test_samples_x1.std(unbiased=False).item())
+            print(f"  [FINAL CHECK] X1 mean/std: {x1_final_mean:.4f}, {x1_final_std:.4f} (target: 2.0, {np.sqrt(0.99):.4f})")
         
         # DDPM for X2
         if (self.config.reuse_pretrained and not self.config.retrain_ddpm and os.path.exists(model_x2_path)):
@@ -2062,6 +2107,29 @@ class AblationRunner:
                 conditional=False
             )
             
+            # DIAGNOSTIC: Verify X2 data stats
+            x2_real_mean = float(x2_data.mean().item())
+            x2_real_std = float(x2_data.std(unbiased=False).item())
+            print(f"  [REAL X2] mean={x2_real_mean:.4f}, std={x2_real_std:.4f} (target: 10.0, 1.0)")
+            
+            # DIAGNOSTIC: Prove two independent models (not shared weights)
+            # Always check when both models exist (newly created or loaded)
+            with torch.no_grad():
+                w1 = next(ddpm_x1.model.parameters())
+                w2 = next(ddpm_x2.model.parameters())
+                same_tensor = w1.data_ptr() == w2.data_ptr()
+                param_l2_diff = float((w1 - w2).norm().item())
+                x1_params = sum(p.numel() for p in ddpm_x1.model.parameters())
+                x2_params = sum(p.numel() for p in ddpm_x2.model.parameters())
+            print(f"  [CHECK] DDPM X1 params: {x1_params}")
+            print(f"  [CHECK] DDPM X2 params: {x2_params}")
+            print(f"  [CHECK] Same tensor object: {same_tensor} (should be False)")
+            print(f"  [CHECK] Initial L2 diff: {param_l2_diff:.6f} (should be > 0)")
+            if same_tensor:
+                print(f"  [ERROR] Models share weights! This is a bug.")
+            if param_l2_diff < 1e-6:
+                print(f"  [WARNING] Models have identical parameters - may not learn different distributions")
+            
             dataset = TensorDataset(x2_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
             
@@ -2079,9 +2147,10 @@ class AblationRunner:
                     # === Pretraining diagnostics: samples, stats, KL, histograms ===
                     try:
                         with torch.no_grad():
-                            # Use the SAME number of diagnostic samples for every dimension
-                            num_samples = 50000
-                            samples = ddpm_x2.sample(num_samples)
+                            # Reduced diagnostic samples to prevent OOM/timeout (5k is enough for mean/std/KL)
+                            num_samples = 5000
+                            chunk_size = 1024 if dim <= 10 else 512
+                            samples = self._chunked_uncond_sample(ddpm_x2, num_samples, ddpm_x2.timesteps, chunk_size=chunk_size)
                             samples_cpu = samples.detach().cpu()
 
                         mean_val = float(samples_cpu.mean().item())
@@ -2162,6 +2231,13 @@ class AblationRunner:
             
             ddpm_x2.save(model_x2_path)
             print(f"  [SAVE] Saved DDPM X2 to {model_x2_path}")
+            
+            # DIAGNOSTIC: End-to-end truth test for X2
+            with torch.no_grad():
+                test_samples_x2 = self._chunked_uncond_sample(ddpm_x2, 10000, ddpm_x2.timesteps, chunk_size=2048)
+                x2_final_mean = float(test_samples_x2.mean().item())
+                x2_final_std = float(test_samples_x2.std(unbiased=False).item())
+            print(f"  [FINAL CHECK] X2 mean/std: {x2_final_mean:.4f}, {x2_final_std:.4f} (target: 10.0, 1.0)")
         
         return ddpm_x1, ddpm_x2
     
