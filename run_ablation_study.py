@@ -360,17 +360,23 @@ class InformationMetrics:
         mae_12 = np.abs(x2_gen - (x1_true + 8.0)).mean()
         mae = (mae_21 + mae_12) / 2
         
+        # KL metrics: clarify naming to avoid confusion
+        kl_sum_per_dim = float(kl_1 + kl_2)  # Sum of per-dim KLs (normalized metric)
+        kl_total_over_dims = float((kl_1 + kl_2) * dim)  # Total KL over all dimensions
+        
         return {
             'kl_x1_per_dim': float(kl_1),  # Average KL per dimension for X1 marginal
             'kl_x2_per_dim': float(kl_2),  # Average KL per dimension for X2 marginal
-            'kl_marginals_per_dim_sum': float(kl_1 + kl_2),  # Sum of per-dim KLs across both marginals (NOT total KL)
+            'kl_sum_per_dim': kl_sum_per_dim,  # Sum of per-dim KLs across both marginals (normalized)
+            'kl_total_over_dims': kl_total_over_dims,  # Total KL over all dimensions (scales with dim)
             # Legacy aliases for backward compatibility
+            'kl_marginals_per_dim_sum': kl_sum_per_dim,
             'kl_div_1': float(kl_1),
             'kl_div_2': float(kl_2),
             'kl_div_1_per_dim': float(kl_1),
             'kl_div_2_per_dim': float(kl_2),
-            'kl_per_dim_sum': float(kl_1 + kl_2),
-            'kl_div_total': float(kl_1 + kl_2),
+            'kl_per_dim_sum': kl_sum_per_dim,
+            'kl_div_total': kl_sum_per_dim,
             'entropy_x1': float(h_x1),
             'entropy_x2': float(h_x2),
             'joint_entropy': float(h_joint),
@@ -882,6 +888,9 @@ class ESTrainer:
             else:
                 eps = self.actor.model(x, t, self.actor.t_scale)
             
+            # CRITICAL: Clamp eps to match PPO rollout (fair comparison)
+            eps = torch.clamp(eps, -10.0, 10.0)
+            
             mean, std = self.actor.p_mean_std(x, t, eps)
             std = std.clamp_min(1e-4)
             
@@ -917,6 +926,9 @@ class ESTrainer:
                 eps = self.actor.model(x, t, self.actor.t_scale, y_cond)
             else:
                 eps = self.actor.model(x, t, self.actor.t_scale)
+            
+            # CRITICAL: Clamp eps to match PPO rollout (fair comparison)
+            eps = torch.clamp(eps, -10.0, 10.0)
             
             mean, std = self.actor.p_mean_std(x, t, eps)
             std = std.clamp_min(1e-4)
@@ -1755,7 +1767,8 @@ class AblationRunner:
         model_x2_path = os.path.join(self.pretrained_models_dir, f"ddpm_x2_{tag}.pt")
         
         # Generate training data
-        x1_data = torch.randn(self.config.ddpm_num_samples, dim) * 1.0 + 2.0
+        # CRITICAL: X1 std = sqrt(0.99) to match eval distribution and KL target
+        x1_data = torch.randn(self.config.ddpm_num_samples, dim) * np.sqrt(0.99) + 2.0
         x2_data = torch.randn(self.config.ddpm_num_samples, dim) * 1.0 + 10.0
         
         # DDPM for X1
@@ -2004,8 +2017,9 @@ class AblationRunner:
             
             for step in range(num_es_steps):
                 # Sample unpaired marginals (same as PPO)
+                # CRITICAL: X1 std = sqrt(0.99) to match eval distribution and KL target
                 batch_size = self.config.coupling_batch_size
-                x1_batch = torch.randn(batch_size, dim, device=self.config.device) * 1.0 + 2.0
+                x1_batch = torch.randn(batch_size, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
                 x2_batch = torch.randn(batch_size, dim, device=self.config.device) * 1.0 + 10.0
                 
                 # Common random seed for variance reduction
@@ -2033,8 +2047,11 @@ class AblationRunner:
             fast_eval = ((epoch + 1) % self.config.plot_every != 0) and ((epoch + 1) != self.config.coupling_epochs)
             metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true, fast=fast_eval)
             metrics['epoch'] = epoch + 1
-            # Use base reward for loss (consistent with actor objective, not population fitness)
-            metrics['loss'] = float(-np.mean([log.get('reward_base', 0.0) for log in epoch_logs]))
+            # Use actual objective (reward - λ*KL) for loss (consistent with actor optimization)
+            # This matches what ES actually optimizes, not just reward_base
+            obj_base = np.mean([log.get('reward_base', 0.0) - kl_weight * log.get('kl_base', 0.0) for log in epoch_logs])
+            metrics['loss'] = float(-obj_base)
+            metrics['obj_base'] = float(obj_base)  # Store actual objective for reference
             metrics['sigma'] = sigma
             metrics['lr'] = lr
             metrics['phase'] = 'es'
@@ -2197,7 +2214,8 @@ class AblationRunner:
             # Sample fresh unpaired marginals for each update (much faster than dataloader)
             for step in range(self.config.ppo_updates_per_epoch):
                 # Sample unpaired marginals on-the-fly
-                x1_batch = torch.randn(self.config.coupling_batch_size, dim, device=self.config.device) * 1.0 + 2.0
+                # CRITICAL: X1 std = sqrt(0.99) to match eval distribution and KL target
+                x1_batch = torch.randn(self.config.coupling_batch_size, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
                 x2_batch = torch.randn(self.config.coupling_batch_size, dim, device=self.config.device) * 1.0 + 10.0
                 
                 # Use same seed pattern as ES for fairness
@@ -2449,6 +2467,15 @@ class AblationRunner:
         fig = plt.figure(figsize=(24, 16))
         gs = GridSpec(4, 4, figure=fig)
         
+        # Safe numeric helper for NaN/Inf handling (critical for fast-eval metrics)
+        def fin(x, default=np.nan):
+            """Safely convert to finite float, handling NaN/Inf."""
+            try:
+                x = float(x)
+                return x if np.isfinite(x) else default
+            except Exception:
+                return default
+        
         # Helper function to plot with warmup/training boundary
         def plot_metric(ax, all_epochs, all_values, ylabel, title, color='blue'):
             """Plot metric with phase boundary line."""
@@ -2465,27 +2492,27 @@ class AblationRunner:
             ax.legend(loc='best', fontsize=8)
             ax.grid(True, alpha=0.3)
         
-        # Row 1: Primary metrics
+        # Row 1: Primary metrics (use safe numeric helper)
         ax1 = fig.add_subplot(gs[0, 0])
-        plot_metric(ax1, epochs, [m['loss'] for m in all_metrics], 
+        plot_metric(ax1, epochs, [fin(m.get('loss')) for m in all_metrics], 
                    'Loss', 'Training Loss', 'navy')
         
         ax2 = fig.add_subplot(gs[0, 1])
-        plot_metric(ax2, epochs, [m['kl_div_total'] for m in all_metrics], 
+        plot_metric(ax2, epochs, [fin(m.get('kl_div_total')) for m in all_metrics], 
                    'KL Divergence (per-dim)', 'KL Divergence', 'darkred')
         
         ax3 = fig.add_subplot(gs[0, 2])
-        plot_metric(ax3, epochs, [m['correlation'] for m in all_metrics], 
+        plot_metric(ax3, epochs, [fin(m.get('correlation')) for m in all_metrics], 
                    'Correlation', 'Correlation', 'darkgreen')
         
         ax4 = fig.add_subplot(gs[0, 3])
-        plot_metric(ax4, epochs, [m['mae'] for m in all_metrics], 
+        plot_metric(ax4, epochs, [fin(m.get('mae')) for m in all_metrics], 
                    'MAE', 'Mean Absolute Error', 'purple')
         
         # Row 2: KL components and MAE directional
         ax5 = fig.add_subplot(gs[1, 0])
-        ax5.plot(epochs, [m['kl_div_1'] for m in all_metrics], 'b-', linewidth=2, marker='o', label='KL(X1)', markersize=5)
-        ax5.plot(epochs, [m['kl_div_2'] for m in all_metrics], 'r-', linewidth=2, marker='o', label='KL(X2)', markersize=5)
+        ax5.plot(epochs, [fin(m.get('kl_div_1')) for m in all_metrics], 'b-', linewidth=2, marker='o', label='KL(X1)', markersize=5)
+        ax5.plot(epochs, [fin(m.get('kl_div_2')) for m in all_metrics], 'r-', linewidth=2, marker='o', label='KL(X2)', markersize=5)
         if warmup_boundary is not None:
             ax5.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
         ax5.set_xlabel('Epoch')
@@ -2495,8 +2522,8 @@ class AblationRunner:
         ax5.grid(True)
         
         ax6 = fig.add_subplot(gs[1, 1])
-        ax6.plot(epochs, [m['mae_x2_to_x1'] for m in all_metrics], 'b-', linewidth=2, marker='o', label='X2→X1', markersize=5)
-        ax6.plot(epochs, [m['mae_x1_to_x2'] for m in all_metrics], 'r-', linewidth=2, marker='o', label='X1→X2', markersize=5)
+        ax6.plot(epochs, [fin(m.get('mae_x2_to_x1')) for m in all_metrics], 'b-', linewidth=2, marker='o', label='X2→X1', markersize=5)
+        ax6.plot(epochs, [fin(m.get('mae_x1_to_x2')) for m in all_metrics], 'r-', linewidth=2, marker='o', label='X1→X2', markersize=5)
         if warmup_boundary is not None:
             ax6.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
         ax6.set_xlabel('Epoch')
@@ -2506,12 +2533,12 @@ class AblationRunner:
         ax6.grid(True)
         
         ax7 = fig.add_subplot(gs[1, 2])
-        plot_metric(ax7, epochs, [m['mutual_information'] for m in all_metrics], 
+        plot_metric(ax7, epochs, [fin(m.get('mutual_information')) for m in all_metrics], 
                    'Mutual Information', 'Mutual Information I(X;Y)', 'purple')
         
         ax8 = fig.add_subplot(gs[1, 3])
-        ax8.plot(epochs, [m['mi_x2_to_x1'] for m in all_metrics], 'b-', linewidth=2, marker='o', label='I(X2;X1)', markersize=5)
-        ax8.plot(epochs, [m['mi_x1_to_x2'] for m in all_metrics], 'r-', linewidth=2, marker='o', label='I(X1;X2)', markersize=5)
+        ax8.plot(epochs, [fin(m.get('mi_x2_to_x1')) for m in all_metrics], 'b-', linewidth=2, marker='o', label='I(X2;X1)', markersize=5)
+        ax8.plot(epochs, [fin(m.get('mi_x1_to_x2')) for m in all_metrics], 'r-', linewidth=2, marker='o', label='I(X1;X2)', markersize=5)
         if warmup_boundary is not None:
             ax8.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
         ax8.set_xlabel('Epoch')
@@ -2520,11 +2547,14 @@ class AblationRunner:
         ax8.legend()
         ax8.grid(True)
         
-        # Row 3: Entropy metrics
+        # Row 3: Entropy metrics (use safe numeric helper)
         ax9 = fig.add_subplot(gs[2, 0])
-        ax9.plot(epochs, [m['entropy_x1'] for m in all_metrics], 'b-', linewidth=2, marker='o', label='H(X1)', markersize=5)
-        ax9.plot(epochs, [m['entropy_x2'] for m in all_metrics], 'r-', linewidth=2, marker='o', label='H(X2)', markersize=5)
-        ax9.plot(epochs, [m['h_theoretical'] for m in all_metrics], 'g--', linewidth=2, label='H(theoretical)')
+        h_x1_vals = [fin(m.get('entropy_x1')) for m in all_metrics]
+        h_x2_vals = [fin(m.get('entropy_x2')) for m in all_metrics]
+        h_theoretical_vals = [fin(m.get('h_theoretical')) for m in all_metrics]
+        ax9.plot(epochs, h_x1_vals, 'b-', linewidth=2, marker='o', label='H(X1)', markersize=5)
+        ax9.plot(epochs, h_x2_vals, 'r-', linewidth=2, marker='o', label='H(X2)', markersize=5)
+        ax9.plot(epochs, h_theoretical_vals, 'g--', linewidth=2, label='H(theoretical)')
         if warmup_boundary is not None:
             ax9.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
         ax9.set_xlabel('Epoch')
@@ -2534,7 +2564,7 @@ class AblationRunner:
         ax9.grid(True)
         
         ax10 = fig.add_subplot(gs[2, 1])
-        ax10.plot(epochs, [m['joint_entropy'] for m in all_metrics], 'purple', linewidth=2, marker='o', markersize=5)
+        ax10.plot(epochs, [fin(m.get('joint_entropy')) for m in all_metrics], 'purple', linewidth=2, marker='o', markersize=5)
         if warmup_boundary is not None:
             ax10.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
         ax10.set_xlabel('Epoch')
@@ -2543,8 +2573,10 @@ class AblationRunner:
         ax10.grid(True)
         
         ax11 = fig.add_subplot(gs[2, 2])
-        ax11.plot(epochs, [m['h_x1_given_x2'] for m in all_metrics], 'b-', linewidth=2, marker='o', label='H(X1|X2)', markersize=5)
-        ax11.plot(epochs, [m['h_x2_given_x1'] for m in all_metrics], 'r-', linewidth=2, marker='o', label='H(X2|X1)', markersize=5)
+        h_x1_given_x2_vals = [fin(m.get('h_x1_given_x2')) for m in all_metrics]
+        h_x2_given_x1_vals = [fin(m.get('h_x2_given_x1')) for m in all_metrics]
+        ax11.plot(epochs, h_x1_given_x2_vals, 'b-', linewidth=2, marker='o', label='H(X1|X2)', markersize=5)
+        ax11.plot(epochs, h_x2_given_x1_vals, 'r-', linewidth=2, marker='o', label='H(X2|X1)', markersize=5)
         if warmup_boundary is not None:
             ax11.axvline(x=warmup_boundary, color='gray', linestyle='--', linewidth=1.5, alpha=0.6)
         ax11.set_xlabel('Epoch')
@@ -2555,10 +2587,15 @@ class AblationRunner:
         
         ax12 = fig.add_subplot(gs[2, 3])
         # Info-theoretic relationship: I(X;Y) = H(X) - H(X|Y)
-        mi_vals = [m['mutual_information'] for m in all_metrics]
-        h_x1_vals = [m['entropy_x1'] for m in all_metrics]
-        h_x1_given_x2_vals = [m['h_x1_given_x2'] for m in all_metrics]
-        derived_mi = [max(0, h_x1_vals[i] - h_x1_given_x2_vals[i]) for i in range(len(epochs))]
+        # Use safe numeric helper and compute derived MI safely
+        mi_vals = [fin(m.get('mutual_information')) for m in all_metrics]
+        # Reuse h_x1_vals and h_x1_given_x2_vals from ax11 (already computed with fin)
+        derived_mi = []
+        for hx, hxgy in zip(h_x1_vals, h_x1_given_x2_vals):
+            if np.isfinite(hx) and np.isfinite(hxgy):
+                derived_mi.append(max(0.0, hx - hxgy))
+            else:
+                derived_mi.append(np.nan)
         ax12.plot(epochs, mi_vals, 'b-', linewidth=2, marker='o', label='MI (computed)', markersize=5)
         ax12.plot(epochs, derived_mi, 'r--', linewidth=2, label='H(X1)-H(X1|X2)', markersize=5)
         if warmup_boundary is not None:
