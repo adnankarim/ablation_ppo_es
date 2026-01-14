@@ -721,17 +721,18 @@ class MultiDimDDPM:
         return x
     
     def save(self, path: str):
-        """Save model."""
-        torch.save({
+        """Save model (optimizer optional)."""
+        payload = {
             'model_state_dict': self.model.state_dict(),
-            'optimizer_state_dict': self.optimizer.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict() if self.optimizer is not None else None,
             'dim': self.dim,
             'timesteps': self.timesteps,
             'conditional': self.conditional,
-        }, path)
+        }
+        torch.save(payload, path)
     
     def load(self, path: str):
-        """Load model with safety checks."""
+        """Load model with safety checks (optimizer optional)."""
         checkpoint = torch.load(path, map_location=self.device)
         
         # Verify checkpoint matches current model configuration
@@ -743,7 +744,10 @@ class MultiDimDDPM:
             f"Checkpoint conditional {checkpoint['conditional']} != model conditional {self.conditional}"
         
         self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        opt_state = checkpoint.get('optimizer_state_dict', None)
+        if self.optimizer is not None and opt_state is not None:
+            self.optimizer.load_state_dict(opt_state)
     
     @torch.no_grad()
     def p_mean_std(self, x_t: torch.Tensor, t: torch.Tensor, eps_pred: torch.Tensor):
@@ -2647,16 +2651,25 @@ Learned vs Target:
     def _score_config(self, metrics: Dict) -> float:
         """
         Score configuration: lower is better.
+        Robust to NaN/Inf (e.g., fast eval MI/entropy are np.nan).
         Uses MAE (primary) + correlation/MI (secondary) with mild KL constraint.
         This prevents selecting models that ignore conditioning (low KL but high MAE).
         
         CRITICAL: MI is normalized by dimension to prevent dimension bias.
         """
-        mae = metrics.get('mae', float('inf'))
-        kl = metrics.get('kl_div_total', float('inf'))
-        corr = metrics.get('correlation', 0.0)
-        mi = metrics.get('mutual_information', 0.0)
-        dim = max(1, int(metrics.get('dim', 1)))  # Get dimension from metrics
+        def safe(x, default):
+            """Safely convert to float, handling NaN/Inf."""
+            try:
+                v = float(x)
+                return v if np.isfinite(v) else float(default)
+            except Exception:
+                return float(default)
+        
+        mae = safe(metrics.get('mae', float('inf')), float('inf'))
+        kl = safe(metrics.get('kl_div_total', float('inf')), float('inf'))
+        corr = safe(metrics.get('correlation', 0.0), 0.0)
+        mi = safe(metrics.get('mutual_information', 0.0), 0.0)
+        dim = max(1, int(safe(metrics.get('dim', 1), 1)))
         
         # Normalize MI by dimension to prevent dimension bias
         mi_norm = mi / dim
