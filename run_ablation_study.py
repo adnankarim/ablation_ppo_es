@@ -218,6 +218,7 @@ class InformationMetrics:
         target_mu2: float = 10.0,
         target_std: float = 1.0,
         dim: int = 1,
+        fast: bool = False,
     ) -> Dict[str, float]:
         """Compute all information-theoretic metrics."""
         
