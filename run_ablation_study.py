@@ -1649,6 +1649,10 @@ class AblationRunner:
         # Store results
         self.all_results = {}
         
+        # Store normalization stats per dimension (for denormalization during evaluation)
+        # Format: {dim: {'x1_mean': tensor, 'x1_std': tensor, 'x2_mean': tensor, 'x2_std': tensor}}
+        self.normalization_stats = {}
+        
         print(f"Ablation study initialized")
         print(f"Output directory: {self.output_dir}")
         print(f"Pretrained models directory: {self.pretrained_models_dir}")
@@ -1660,10 +1664,8 @@ class AblationRunner:
     def smart_load_weights(self, cond_ddpm: MultiDimDDPM, base_ddpm: MultiDimDDPM, dim: int,
                           random_cond_init: bool = False, cond_scale: float = 1e-3):
         """
-        Initialize ConditionalMultiDimMLP from MultiDimMLP:
-          - time_embed copied exactly
-          - net layers copied where shapes match
-          - first net layer: copy x + time parts, init condition part (zeros or small random)
+        Correctly transfers weights between MultiDimMLP and ConditionalMultiDimMLP
+        by accessing layers by name (input_proj, layer1, etc.) rather than 'net'.
         
         Args:
             cond_ddpm: Conditional model to load weights into
@@ -1679,49 +1681,53 @@ class AblationRunner:
         # 1) Copy time embedding exactly
         cond_m.time_embed.load_state_dict(base_m.time_embed.state_dict())
 
-        # 2) Copy all shared layers except the first Linear, which has different input width
-        # net: [Linear0, SiLU, Linear1, SiLU, Linear2, SiLU, Linear3]
-        # Only Linear0 differs (input dim)
-        for idx in [2, 4, 6]:  # indices of Linear layers after the first
-            cond_m.net[idx].load_state_dict(base_m.net[idx].state_dict())
+        # 2) Copy hidden layers and output (shapes match exactly)
+        # The classes define these as layer1, layer2, layer3, output
+        cond_m.layer1.load_state_dict(base_m.layer1.state_dict())
+        cond_m.layer2.load_state_dict(base_m.layer2.state_dict())
+        cond_m.layer3.load_state_dict(base_m.layer3.state_dict())
+        cond_m.output.load_state_dict(base_m.output.state_dict())
 
-        # 3) Handle first Linear weight mapping
-        # base Linear0: in = dim + t_emb
-        # cond Linear0: in = 2*dim + t_emb  (x, condition, t_emb)
-        base_L0 = base_m.net[0]
-        cond_L0 = cond_m.net[0]
+        # 3) Handle input projection (Linear layer size mismatch)
+        # base input_proj: in_features = dim + time_embed_dim
+        # cond input_proj: in_features = 2*dim + time_embed_dim
+        base_in = base_m.input_proj
+        cond_in = cond_m.input_proj
 
         with torch.no_grad():
             # Zero everything first
-            cond_L0.weight.zero_()
-            cond_L0.bias.copy_(base_L0.bias)
+            cond_in.weight.zero_()
+            cond_in.bias.copy_(base_in.bias)
 
-            # base order: [x | t_emb]
-            # cond order: [x | cond | t_emb]
-            t_emb_dim = base_L0.weight.shape[1] - dim
+            # Determine sizes
+            # base order: [x (dim) | t_emb]
+            # cond order: [x (dim) | condition (dim) | t_emb]
+            t_emb_dim = base_in.weight.shape[1] - dim
 
-            # Copy x block
-            cond_L0.weight[:, :dim].copy_(base_L0.weight[:, :dim])
+            # A. Copy x block (first 'dim' columns)
+            cond_in.weight[:, :dim].copy_(base_in.weight[:, :dim])
 
-            # Copy time-embedding block (base tail) into conditional tail
-            cond_L0.weight[:, 2*dim:2*dim + t_emb_dim].copy_(base_L0.weight[:, dim:dim + t_emb_dim])
+            # B. Copy time-embedding block (from end of base to end of cond)
+            # Base: columns [dim : dim+t_emb]
+            # Cond: columns [2*dim : 2*dim+t_emb]
+            cond_in.weight[:, 2*dim : 2*dim+t_emb_dim].copy_(base_in.weight[:, dim : dim+t_emb_dim])
 
-            # Init condition block
+            # C. Initialize condition block (middle 'dim' columns)
             if random_cond_init:
                 # Scale cond_scale with dimension for better signal in high dims
-                # Higher dims need larger init scale to provide measurable conditional signal
                 if dim <= 10:
                     mult = 1.0
                 elif dim <= 20:
                     mult = 3.0
                 else:
-                    mult = 10.0  # makes 1e-3 -> 1e-2 for 30D
+                    mult = 10.0 
                 
                 effective_scale = cond_scale * mult
-                cond_L0.weight[:, dim:2*dim].normal_(mean=0.0, std=effective_scale)
+                # Inject noise into the conditioning columns [dim : 2*dim]
+                cond_in.weight[:, dim:2*dim].normal_(mean=0.0, std=effective_scale)
                 print(f"    [SMART LOAD] Spliced random cond weights (scale={effective_scale:.1e})")
             else:
-                cond_L0.weight[:, dim:2*dim].zero_()
+                cond_in.weight[:, dim:2*dim].zero_()
                 print(f"    [SMART LOAD] Spliced zero weights for conditioning input")
     
     @torch.no_grad()
@@ -1940,8 +1946,31 @@ class AblationRunner:
         
         # Generate training data
         # CRITICAL: X1 std = sqrt(0.99) to match eval distribution and KL target
-        x1_data = torch.randn(self.config.ddpm_num_samples, dim) * np.sqrt(0.99) + 2.0
-        x2_data = torch.randn(self.config.ddpm_num_samples, dim) * 1.0 + 10.0
+        x1_raw = torch.randn(self.config.ddpm_num_samples, dim) * np.sqrt(0.99) + 2.0
+        x2_raw = torch.randn(self.config.ddpm_num_samples, dim) * 1.0 + 10.0
+        
+        # === FIX: NORMALIZE DATA ===
+        # Calculate stats (per-dimension to handle multi-dim correctly)
+        x1_mean = x1_raw.mean(dim=0, keepdim=True)
+        x1_std = x1_raw.std(dim=0, keepdim=True) + 1e-8  # Add small epsilon to avoid division by zero
+        x2_mean = x2_raw.mean(dim=0, keepdim=True)
+        x2_std = x2_raw.std(dim=0, keepdim=True) + 1e-8
+        
+        # Store normalization stats for later denormalization
+        self.normalization_stats[dim] = {
+            'x1_mean': x1_mean,
+            'x1_std': x1_std,
+            'x2_mean': x2_mean,
+            'x2_std': x2_std
+        }
+        
+        # Normalize to N(0,1) - DDPMs work best with normalized data
+        x1_data = (x1_raw - x1_mean) / x1_std
+        x2_data = (x2_raw - x2_mean) / x2_std
+        
+        print(f"  [DATA] Normalized X1 and X2. X1: mean={x1_mean.mean().item():.4f}, std={x1_std.mean().item():.4f} -> normalized")
+        print(f"  [DATA] Normalized X1 and X2. X2: mean={x2_mean.mean().item():.4f}, std={x2_std.mean().item():.4f} -> normalized")
+        # ===========================
         
         # DDPM for X1
         if (self.config.reuse_pretrained and not self.config.retrain_ddpm and os.path.exists(model_x1_path)):
@@ -2126,7 +2155,13 @@ class AblationRunner:
             
             # DIAGNOSTIC: End-to-end truth test for X1
             with torch.no_grad():
-                test_samples_x1 = self._chunked_uncond_sample(ddpm_x1, 10000, ddpm_x1.timesteps, chunk_size=2048)
+                test_samples_x1_norm = self._chunked_uncond_sample(ddpm_x1, 10000, ddpm_x1.timesteps, chunk_size=2048)
+                # Denormalize if normalization was used
+                if dim in self.normalization_stats:
+                    stats = self.normalization_stats[dim]
+                    test_samples_x1 = test_samples_x1_norm * stats['x1_std'] + stats['x1_mean']
+                else:
+                    test_samples_x1 = test_samples_x1_norm
                 x1_final_mean = float(test_samples_x1.mean().item())
                 x1_final_std = float(test_samples_x1.std(unbiased=False).item())
             print(f"  [FINAL CHECK]")
@@ -2287,7 +2322,13 @@ class AblationRunner:
             
             # DIAGNOSTIC: End-to-end truth test for X2
             with torch.no_grad():
-                test_samples_x2 = self._chunked_uncond_sample(ddpm_x2, 10000, ddpm_x2.timesteps, chunk_size=2048)
+                test_samples_x2_norm = self._chunked_uncond_sample(ddpm_x2, 10000, ddpm_x2.timesteps, chunk_size=2048)
+                # Denormalize if normalization was used
+                if dim in self.normalization_stats:
+                    stats = self.normalization_stats[dim]
+                    test_samples_x2 = test_samples_x2_norm * stats['x2_std'] + stats['x2_mean']
+                else:
+                    test_samples_x2 = test_samples_x2_norm
                 x2_final_mean = float(test_samples_x2.mean().item())
                 x2_final_std = float(test_samples_x2.std(unbiased=False).item())
             print(f"  [FINAL CHECK]")
@@ -2756,10 +2797,25 @@ class AblationRunner:
             # Sample from conditional models with error handling
             # Always use proper conditioning (no shuffling)
             # Chunked sampling prevents OOM and keeps eval fair (same frozen eval set).
+            # NOTE: Models output normalized samples, need to denormalize before evaluation
             with torch.no_grad():
                 chunk_size = 4096 if dim <= 10 else 2048
-                x1_gen = self._chunked_cond_sample(cond_x1, x2_true, self.config.num_sampling_steps, chunk_size=chunk_size)
-                x2_gen = self._chunked_cond_sample(cond_x2, x1_true, self.config.num_sampling_steps, chunk_size=chunk_size)
+                x1_gen_norm = self._chunked_cond_sample(cond_x1, x2_true, self.config.num_sampling_steps, chunk_size=chunk_size)
+                x2_gen_norm = self._chunked_cond_sample(cond_x2, x1_true, self.config.num_sampling_steps, chunk_size=chunk_size)
+            
+            # === FIX: DENORMALIZE GENERATED SAMPLES ===
+            # Models were trained on normalized data, so outputs are in normalized space
+            # Must denormalize before comparing to true (unnormalized) data
+            if dim in self.normalization_stats:
+                stats = self.normalization_stats[dim]
+                x1_gen = x1_gen_norm * stats['x1_std'] + stats['x1_mean']
+                x2_gen = x2_gen_norm * stats['x2_std'] + stats['x2_mean']
+            else:
+                # Fallback: assume no normalization was used (for backward compatibility)
+                print(f"    [WARNING] No normalization stats found for dim={dim}, assuming unnormalized data")
+                x1_gen = x1_gen_norm
+                x2_gen = x2_gen_norm
+            # ==========================================
             
             # Convert to numpy
             x1_gen_np = x1_gen.cpu().numpy()
