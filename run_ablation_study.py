@@ -27,7 +27,6 @@ import csv
 import datetime
 import argparse
 import time
-import shutil
 import itertools
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple, Optional, Any
@@ -2000,10 +1999,10 @@ class AblationRunner:
                 conditional=False
             )
             
-            # DIAGNOSTIC: Verify X1 data stats
+            # DIAGNOSTIC: Verify X1 data stats (normalized space)
             x1_real_mean = float(x1_data.mean().item())
             x1_real_std = float(x1_data.std(unbiased=False).item())
-            print(f"  [REAL X1] mean={x1_real_mean:.4f}, std={x1_real_std:.4f} (target: 2.0, {np.sqrt(0.99):.4f})")
+            print(f"  [REAL X1] mean={x1_real_mean:.4f}, std={x1_real_std:.4f} (normalized, target: 0.0, 1.0)")
             
             dataset = TensorDataset(x1_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
@@ -2045,23 +2044,38 @@ class AblationRunner:
                             samples_cpu = samples.detach().cpu()
 
                         # Aggregate scalar stats over all dims/samples for easy plotting
-                        mean_val = float(samples_cpu.mean().item())
-                        var_val = float(samples_cpu.var(unbiased=False).item())
-                        std_val = float(math.sqrt(max(var_val, 0.0)))
+                        mean_val_norm = float(samples_cpu.mean().item())
+                        var_val_norm = float(samples_cpu.var(unbiased=False).item())
+                        std_val_norm = float(math.sqrt(max(var_val_norm, 0.0)))
+                        
+                        # Denormalize for display (show what it means in original space)
+                        if dim in self.normalization_stats:
+                            stats = self.normalization_stats[dim]
+                            mean_val_denorm = float((samples_cpu * stats['x1_std'] + stats['x1_mean']).mean().item())
+                            std_val_denorm = float((samples_cpu * stats['x1_std'] + stats['x1_mean']).std(unbiased=False).item())
+                        else:
+                            mean_val_denorm = mean_val_norm
+                            std_val_denorm = std_val_norm
 
-                        # DIAGNOSTIC: Compare real data stats vs generated stats
-                        # Sample a batch from training data to verify target distribution
-                        # Generate fresh samples matching training distribution for comparison
+                        # DIAGNOSTIC: Compare real data stats vs generated stats (in normalized space)
+                        # Sample a batch from normalized training data to verify target distribution
                         with torch.no_grad():
-                            real_batch = torch.randn(min(1000, num_samples), dim, device=self.config.device) * np.sqrt(0.99) + 2.0
+                            # Generate normalized real data (same as training data)
+                            real_batch_raw = torch.randn(min(1000, num_samples), dim, device=self.config.device) * np.sqrt(0.99) + 2.0
+                            # Normalize using stored stats
+                            if dim in self.normalization_stats:
+                                stats = self.normalization_stats[dim]
+                                real_batch = (real_batch_raw - stats['x1_mean']) / stats['x1_std']
+                            else:
+                                real_batch = real_batch_raw
                             real_mean = float(real_batch.mean().item())
                             real_std = float(real_batch.std(unbiased=False).item())
 
-                        # Target for X1: N(2, sqrt(0.99)) to match eval distribution
-                        target_mu1 = 2.0
-                        target_std1 = math.sqrt(0.99)
-                        target_var1 = target_std1 ** 2
-                        kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu1, target_var1))
+                        # Target for X1 in normalized space: N(0, 1)
+                        target_mu1 = 0.0
+                        target_std1 = 1.0
+                        target_var1 = 1.0
+                        kl_val = float(_gaussian_kl_1d(mean_val_norm, var_val_norm, target_mu1, target_var1))
 
                         # DIAGNOSTIC: Check what the model is predicting during sampling
                         # Sample a small batch and check noise prediction quality
@@ -2078,11 +2092,21 @@ class AblationRunner:
                             eps_target_std = float(test_noise.std().item())  # Should be ~1
                             eps_mse = float(nn.functional.mse_loss(test_eps_pred, test_noise).item())
                         
+                        # Denormalize for display (show what it means in original space)
+                        if dim in self.normalization_stats:
+                            stats = self.normalization_stats[dim]
+                            mean_val_denorm = float((samples_cpu * stats['x1_std'] + stats['x1_mean']).mean().item())
+                            std_val_denorm = float((samples_cpu * stats['x1_std'] + stats['x1_mean']).std(unbiased=False).item())
+                        else:
+                            mean_val_denorm = mean_val
+                            std_val_denorm = std_val
+                        
                         # Console output with KL + diagnostic stats
                         print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
-                              f"KL: {kl_val:.6f}, Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu1:.2f}, {target_std1:.4f})")
-                        print(f"      [DIAG] Real data: mean={real_mean:.4f}, std={real_std:.4f} | "
-                              f"Generated: mean={mean_val:.4f}, std={std_val:.4f}")
+                              f"KL: {kl_val:.6f}")
+                        print(f"      [NORM] Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu1:.2f}, {target_std1:.4f})")
+                        print(f"      [DENORM] Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 2.0, {np.sqrt(0.99):.4f})")
+                        print(f"      [DIAG] Real data (normalized): mean={real_mean:.4f}, std={real_std:.4f} | Generated (normalized): mean={mean_val:.4f}, std={std_val:.4f}")
                         print(f"      [DIAG] Noise pred: mean={eps_pred_mean:.4f}, std={eps_pred_std:.4f} "
                               f"(target: {eps_target_mean:.4f}, {eps_target_std:.4f}), MSE={eps_mse:.6f}")
 
@@ -2195,10 +2219,10 @@ class AblationRunner:
                 conditional=False
             )
             
-            # DIAGNOSTIC: Verify X2 data stats
+            # DIAGNOSTIC: Verify X2 data stats (normalized space)
             x2_real_mean = float(x2_data.mean().item())
             x2_real_std = float(x2_data.std(unbiased=False).item())
-            print(f"  [REAL X2] mean={x2_real_mean:.4f}, std={x2_real_std:.4f} (target: 10.0, 1.0)")
+            print(f"  [REAL X2] mean={x2_real_mean:.4f}, std={x2_real_std:.4f} (normalized, target: 0.0, 1.0)")
             
             # DIAGNOSTIC: Prove two independent models (not shared weights)
             # Always check when both models exist (newly created or loaded)
@@ -2244,16 +2268,27 @@ class AblationRunner:
                         mean_val = float(samples_cpu.mean().item())
                         var_val = float(samples_cpu.var(unbiased=False).item())
                         std_val = float(math.sqrt(max(var_val, 0.0)))
+                        
+                        # Denormalize for display (show what it means in original space)
+                        if dim in self.normalization_stats:
+                            stats = self.normalization_stats[dim]
+                            mean_val_denorm = float((samples_cpu * stats['x2_std'] + stats['x2_mean']).mean().item())
+                            std_val_denorm = float((samples_cpu * stats['x2_std'] + stats['x2_mean']).std(unbiased=False).item())
+                        else:
+                            mean_val_denorm = mean_val
+                            std_val_denorm = std_val
 
-                        # Target for X2: N(10, 1.0)
-                        target_mu2 = 10.0
+                        # Target for X2 in normalized space: N(0, 1)
+                        target_mu2 = 0.0
                         target_std2 = 1.0
-                        target_var2 = target_std2 ** 2
+                        target_var2 = 1.0
                         kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu2, target_var2))
 
                         # Console output with KL
                         print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
-                              f"KL: {kl_val:.6f}, Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu2:.2f}, {target_std2:.4f})")
+                              f"KL: {kl_val:.6f}")
+                        print(f"      [NORM] Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu2:.2f}, {target_std2:.4f})")
+                        print(f"      [DENORM] Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 10.0, 1.0)")
 
                         # Optional noise prediction MSE (diagnostic only)
                         with torch.no_grad():
