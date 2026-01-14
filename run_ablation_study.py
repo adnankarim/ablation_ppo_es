@@ -340,10 +340,11 @@ class InformationMetrics:
             'entropy_x1': float(h_x1),
             'entropy_x2': float(h_x2),
             'joint_entropy': float(h_joint),
-            'mutual_information': float(mutual_info),
+            'mutual_information': float(mutual_info),  # True↔generated MI proxy (0.5*(mi_21+mi_12))
+            'mutual_information_true_gen_proxy': float(mutual_info),  # Explicit alias for clarity
             'mi_gen_gen': float(mi_gen_gen),  # Generated->generated MI (for reference)
-            'mi_x2_to_x1': float(mi_21),
-            'mi_x1_to_x2': float(mi_12),
+            'mi_x2_to_x1': float(mi_21),  # I(X2_true; X1_gen)
+            'mi_x1_to_x2': float(mi_12),  # I(X1_true; X2_gen)
             'h_x1_given_x2': float(h_x1_given_x2),
             'h_x2_given_x1': float(h_x2_given_x1),
             'h_theoretical': float(h_theoretical),
@@ -1321,11 +1322,11 @@ class DDMECPPOTrainer:
             std = std.clamp_min(1e-4)
 
             z = torch.randn_like(x)
-            x_prev = mean + std * z
-            # Clamp rollout states to prevent explosion (matches sample() behavior)
-            x_prev = torch.clamp(x_prev, -100.0, 100.0)
-
-            logp = _normal_logprob(x_prev, mean, std)
+            x_prev_raw = mean + std * z
+            # CRITICAL: Compute logp BEFORE clamp (logp is for the unclamped Gaussian)
+            # Clamp the state we carry forward, but logp must be for the actual sampled value
+            logp = _normal_logprob(x_prev_raw, mean, std)
+            x_prev = torch.clamp(x_prev_raw, -100.0, 100.0)  # Clamp state for stability
 
             xs_t.append(x)
             ts.append(t)
@@ -1587,6 +1588,12 @@ class AblationRunner:
                     self.config.es_lr_values
                 ))
                 
+                # Save config grid for job arrays (helps with resume/debugging)
+                es_config_path = os.path.join(self.output_dir, f"es_configs_{dim}d.json")
+                with open(es_config_path, 'w') as f:
+                    json.dump([{"sigma": float(s), "lr": float(lr)} for s, lr in es_configs], f, indent=2)
+                print(f"  [CONFIG] ES config grid saved: {es_config_path} ({len(es_configs)} configs)")
+                
                 # Limit configs if max_es_configs is specified
                 if hasattr(self.config, 'max_es_configs') and self.config.max_es_configs is not None:
                     es_configs = es_configs[:self.config.max_es_configs]
@@ -1617,6 +1624,13 @@ class AblationRunner:
                     self.config.ppo_clip_values,
                     self.config.ppo_lr_values
                 ))
+                
+                # Save config grid for job arrays (helps with resume/debugging)
+                ppo_config_path = os.path.join(self.output_dir, f"ppo_configs_{dim}d.json")
+                with open(ppo_config_path, 'w') as f:
+                    json.dump([{"kl_weight": float(kw), "ppo_clip": float(pc), "lr": float(lr)} 
+                              for kw, pc, lr in ppo_configs], f, indent=2)
+                print(f"  [CONFIG] PPO config grid saved: {ppo_config_path} ({len(ppo_configs)} configs)")
                 
                 # Limit configs if max_ppo_configs is specified
                 if hasattr(self.config, 'max_ppo_configs') and self.config.max_ppo_configs is not None:
