@@ -603,6 +603,9 @@ class MultiDimDDPM:
     
     def train_step(self, x0: torch.Tensor, condition: torch.Tensor = None) -> float:
         """Single training step."""
+        if self.optimizer is None:
+            raise RuntimeError("train_step() called but create_optimizer=False (optimizer is None).")
+        
         self.model.train()
         batch_size = x0.shape[0]
         
