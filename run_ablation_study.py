@@ -329,7 +329,10 @@ class InformationMetrics:
         return {
             'kl_div_1': float(kl_1),
             'kl_div_2': float(kl_2),
-            'kl_div_total': float(kl_1 + kl_2),
+            'kl_div_1_per_dim': float(kl_1),  # Average KL per dimension for X1
+            'kl_div_2_per_dim': float(kl_2),  # Average KL per dimension for X2
+            'kl_per_dim_sum': float(kl_1 + kl_2),  # Sum of per-dim KLs across both marginals (NOT total KL)
+            'kl_div_total': float(kl_1 + kl_2),  # Legacy alias for backward compatibility
             'entropy_x1': float(h_x1),
             'entropy_x2': float(h_x2),
             'joint_entropy': float(h_joint),
@@ -399,6 +402,15 @@ class AblationConfig:
     
     # Model management
     reuse_pretrained: bool = True  # Reuse existing pretrained models if available
+    retrain_ddpm: bool = False  # If True, ignore reuse_pretrained and force retrain
+    
+    # Optional run filters (for job arrays / partial runs)
+    only_dim: Optional[int] = None  # e.g., 10
+    only_method: Optional[str] = None  # "ES" or "PPO"
+    max_es_configs: Optional[int] = None  # e.g., 4
+    es_config_idx: Optional[int] = None  # e.g., 0..len(es_configs)-1
+    max_ppo_configs: Optional[int] = None  # e.g., 8
+    ppo_config_idx: Optional[int] = None  # e.g., 0..len(ppo_configs)-1
     
     # Logging
     log_every: int = 1
@@ -696,6 +708,8 @@ class MultiDimDDPM:
         
         SPECIAL CASE: t == 0 -> output x0_hat deterministically (no noise)
         At t=0, we're already at the final step, so return x0_hat with zero std.
+        
+        CRITICAL: Handles mixed t tensors elementwise (safe for batched calls with mixed timesteps).
         """
         abar_t = self.alphas_cumprod[t].view(-1, 1)
         
@@ -703,14 +717,7 @@ class MultiDimDDPM:
         x0_hat = (x_t - torch.sqrt(1.0 - abar_t) * eps_pred) / (torch.sqrt(abar_t) + 1e-8)
         x0_hat = torch.clamp(x0_hat, -50.0, 50.0)
 
-        # SPECIAL CASE: t == 0 -> output x0_hat deterministically
-        # At t=0, we're already at the final step, so return x0_hat with zero std
-        if torch.all(t == 0):
-            mean = x0_hat
-            std = torch.zeros_like(mean)  # deterministic
-            return mean, std
-
-        # DDPM posterior mean: coef1 * x0_hat + coef2 * x_t (for t > 0)
+        # DDPM posterior mean: coef1 * x0_hat + coef2 * x_t
         coef1 = self.posterior_mean_coef1[t].view(-1, 1)
         coef2 = self.posterior_mean_coef2[t].view(-1, 1)
         mean = coef1 * x0_hat + coef2 * x_t
@@ -718,6 +725,12 @@ class MultiDimDDPM:
         # DDPM posterior variance
         var = self.posterior_variance[t].view(-1, 1)
         std = torch.sqrt(var).clamp_min(1e-8)
+        
+        # SPECIAL CASE: t == 0 -> output x0_hat deterministically (elementwise for mixed batches)
+        # At t=0, we're already at the final step, so return x0_hat with zero std
+        t0 = (t == 0).view(-1, 1)
+        mean = torch.where(t0, x0_hat, mean)
+        std = torch.where(t0, torch.zeros_like(std), std)
         
         return mean, std
 
@@ -1319,10 +1332,7 @@ class DDMECPPOTrainer:
         """
         # Set seed if provided (for fairness with ES common random numbers)
         if seed is not None:
-            torch.manual_seed(seed)
-            if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(seed)
-            np.random.seed(seed % (2**32 - 1))
+            _set_seed(seed)
         
         # 1) rollout using current actor
         x_gen, xs_t, ts, xs_prev, old_logps = self._collect_rollout(y_cond)
@@ -1407,10 +1417,7 @@ class AblationRunner:
         self.config = config
         
         # Set seeds
-        np.random.seed(config.seed)
-        torch.manual_seed(config.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(config.seed)
+        _set_seed(config.seed)
         
         # Create output directories
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1636,15 +1643,17 @@ class AblationRunner:
     def _pretrain_ddpm(self, dim: int) -> Tuple[MultiDimDDPM, MultiDimDDPM]:
         """Pretrain DDPM models for X1 and X2."""
         # Check if models already exist in persistent directory
-        model_x1_path = os.path.join(self.pretrained_models_dir, f"ddpm_x1_{dim}d.pt")
-        model_x2_path = os.path.join(self.pretrained_models_dir, f"ddpm_x2_{dim}d.pt")
+        # CRITICAL: Include timesteps and hidden_dim in filename to prevent cache collisions
+        tag = f"{dim}d_T{self.config.ddpm_timesteps}_H{self.config.ddpm_hidden_dim}"
+        model_x1_path = os.path.join(self.pretrained_models_dir, f"ddpm_x1_{tag}.pt")
+        model_x2_path = os.path.join(self.pretrained_models_dir, f"ddpm_x2_{tag}.pt")
         
         # Generate training data
         x1_data = torch.randn(self.config.ddpm_num_samples, dim) * 1.0 + 2.0
         x2_data = torch.randn(self.config.ddpm_num_samples, dim) * 1.0 + 10.0
         
         # DDPM for X1
-        if self.config.reuse_pretrained and os.path.exists(model_x1_path):
+        if (self.config.reuse_pretrained and not self.config.retrain_ddpm and os.path.exists(model_x1_path)):
             print(f"  [LOAD] Loading pretrained DDPM X1 from {model_x1_path}")
             ddpm_x1 = MultiDimDDPM(
                 dim=dim,
@@ -1687,7 +1696,7 @@ class AblationRunner:
             print(f"  [SAVE] Saved DDPM X1 to {model_x1_path}")
         
         # DDPM for X2
-        if self.config.reuse_pretrained and os.path.exists(model_x2_path):
+        if (self.config.reuse_pretrained and not self.config.retrain_ddpm and os.path.exists(model_x2_path)):
             print(f"  [LOAD] Loading pretrained DDPM X2 from {model_x2_path}")
             ddpm_x2 = MultiDimDDPM(
                 dim=dim,
@@ -3307,13 +3316,14 @@ def main():
         reuse_pretrained=args.reuse_pretrained,
     )
     
-    # Add subsetting controls as attributes (not part of AblationConfig class)
+    # Set subsetting controls and retrain flag (now part of AblationConfig)
     config.only_dim = args.only_dim
-    config.only_method = args.only_method
+    config.only_method = args.only_method if args.only_method != "BOTH" else None
     config.max_es_configs = args.max_es_configs
     config.max_ppo_configs = args.max_ppo_configs
     config.es_config_idx = args.es_config_idx
     config.ppo_config_idx = args.ppo_config_idx
+    config.retrain_ddpm = args.retrain_ddpm
     
     # Run ablation study
     runner = AblationRunner(config)
