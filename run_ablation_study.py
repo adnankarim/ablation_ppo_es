@@ -1855,7 +1855,8 @@ class AblationRunner:
         
         if True:  # Always print budget info
             print(f"    [BUDGET] ES steps per epoch: {num_es_steps} (pop={self.config.es_population_size}, "
-                  f"rollout_budget={rollout_budget}, total_ES_rollouts={num_es_steps * self.config.es_population_size})")
+                  f"rollout_budget={rollout_budget} [PPO_updates={self.config.ppo_updates_per_epoch} * ppo_epochs={ppo_epochs}], "
+                  f"total_ES_rollouts={num_es_steps * self.config.es_population_size})")
         
         for epoch in range(self.config.coupling_epochs):
             epoch_logs = []
