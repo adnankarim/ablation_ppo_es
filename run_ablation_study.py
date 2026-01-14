@@ -3037,186 +3037,216 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
         self._plot_overall_comparison()
     
     def _plot_overall_comparison(self):
-        """Generate overall comparison plots."""
-        fig = plt.figure(figsize=(20, 12))
-        gs = GridSpec(2, 3, figure=fig)
+        """Generate overall comparison plots across dimensions (improved version with CSV export)."""
+        import csv
         
         dims = sorted(self.all_results.keys())
         
-        # Best KL per dimension (using score-based best configs)
+        # Helper: extract best config per dimension
+        def _safe_min_by_score(rows):
+            if not rows:
+                return None
+            return min(rows, key=self._score_config)
+        
+        best_es = {}
+        best_ppo = {}
+        for dim in dims:
+            r = self.all_results[dim]
+            best_es[dim] = _safe_min_by_score(r.get("ES", []))
+            best_ppo[dim] = _safe_min_by_score(r.get("PPO", []))
+        
+        # Helper: extract series for plotting
+        def _as_float(x, default=np.nan):
+            try:
+                return float(x) if x is not None else default
+            except Exception:
+                return default
+        
+        def series(best_map, key):
+            xs, ys = [], []
+            for d in dims:
+                b = best_map.get(d)
+                if b is None:
+                    continue
+                val = _as_float(b.get(key), np.nan)
+                if np.isfinite(val):
+                    xs.append(d)
+                    ys.append(val)
+            return xs, ys
+        
+        # Helper: determine winner per dimension
+        def _winner_by_dim(dim):
+            es = best_es.get(dim)
+            ppo = best_ppo.get(dim)
+            if es is None and ppo is None:
+                return "NONE"
+            if es is None:
+                return "PPO"
+            if ppo is None:
+                return "ES"
+            return "ES" if self._score_config(es) < self._score_config(ppo) else "PPO"
+        
+        # Helper: config string for CSV
+        def _config_str(method, best):
+            if best is None:
+                return "(none)"
+            if method == "ES":
+                return f"σ={best.get('sigma')} lr={best.get('lr')}"
+            return f"kl_w={best.get('kl_weight')} clip={best.get('ppo_clip')} lr={best.get('lr')}"
+        
+        # Save CSV of best configs per dimension
+        overall_csv = os.path.join(self.output_dir, "overall_best_configs.csv")
+        fieldnames = [
+            "dim", "winner",
+            "es_score", "es_kl", "es_corr", "es_mae", "es_mi", "es_mi_per_dim", "es_cfg",
+            "ppo_score", "ppo_kl", "ppo_corr", "ppo_mae", "ppo_mi", "ppo_mi_per_dim", "ppo_cfg",
+        ]
+        with open(overall_csv, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            for dim in dims:
+                es = best_es.get(dim)
+                ppo = best_ppo.get(dim)
+                winner = _winner_by_dim(dim)
+                
+                es_score = _as_float(self._score_config(es), np.nan) if es is not None else np.nan
+                ppo_score = _as_float(self._score_config(ppo), np.nan) if ppo is not None else np.nan
+                
+                row = {
+                    "dim": dim,
+                    "winner": winner,
+                    "es_score": es_score,
+                    "es_kl": _as_float(es.get("kl_div_total"), np.nan) if es else np.nan,
+                    "es_corr": _as_float(es.get("correlation"), np.nan) if es else np.nan,
+                    "es_mae": _as_float(es.get("mae"), np.nan) if es else np.nan,
+                    "es_mi": _as_float(es.get("mutual_information"), np.nan) if es else np.nan,
+                    "es_mi_per_dim": _as_float(es.get("mutual_information_per_dim"), np.nan) if es else np.nan,
+                    "es_cfg": _config_str("ES", es),
+                    "ppo_score": ppo_score,
+                    "ppo_kl": _as_float(ppo.get("kl_div_total"), np.nan) if ppo else np.nan,
+                    "ppo_corr": _as_float(ppo.get("correlation"), np.nan) if ppo else np.nan,
+                    "ppo_mae": _as_float(ppo.get("mae"), np.nan) if ppo else np.nan,
+                    "ppo_mi": _as_float(ppo.get("mutual_information"), np.nan) if ppo else np.nan,
+                    "ppo_mi_per_dim": _as_float(ppo.get("mutual_information_per_dim"), np.nan) if ppo else np.nan,
+                    "ppo_cfg": _config_str("PPO", ppo),
+                }
+                w.writerow(row)
+        
+        print(f"Overall best-config CSV saved: {overall_csv}")
+        
+        # Extract series for plotting
+        es_x_kl, es_y_kl = series(best_es, "kl_div_total")
+        ppo_x_kl, ppo_y_kl = series(best_ppo, "kl_div_total")
+        es_x_mae, es_y_mae = series(best_es, "mae")
+        ppo_x_mae, ppo_y_mae = series(best_ppo, "mae")
+        es_x_corr, es_y_corr = series(best_es, "correlation")
+        ppo_x_corr, ppo_y_corr = series(best_ppo, "correlation")
+        es_x_mipd, es_y_mipd = series(best_es, "mutual_information_per_dim")
+        ppo_x_mipd, ppo_y_mipd = series(best_ppo, "mutual_information_per_dim")
+        
+        # Winner counts
+        winners = [_winner_by_dim(d) for d in dims]
+        es_wins = sum(1 for w in winners if w == "ES")
+        ppo_wins = sum(1 for w in winners if w == "PPO")
+        none_wins = sum(1 for w in winners if w == "NONE")
+        
+        # Create plots
+        fig = plt.figure(figsize=(20, 12))
+        gs = GridSpec(2, 3, figure=fig)
+        
+        # (1) Best KL vs dim
         ax1 = fig.add_subplot(gs[0, 0])
-        es_kls = []
-        ppo_kls = []
-        for dim in dims:
-            results = self.all_results[dim]
-            has_es = len(results['ES']) > 0
-            has_ppo = len(results['PPO']) > 0
-            if has_es:
-                best_es = min(results['ES'], key=self._score_config)
-                es_kls.append(best_es['kl_div_total'])
-            else:
-                es_kls.append(None)
-            if has_ppo:
-                best_ppo = min(results['PPO'], key=self._score_config)
-                ppo_kls.append(best_ppo['kl_div_total'])
-            else:
-                ppo_kls.append(None)
-        
-        # Filter out None values for plotting
-        es_dims_kl = [(d, k) for d, k in zip(dims, es_kls) if k is not None]
-        ppo_dims_kl = [(d, k) for d, k in zip(dims, ppo_kls) if k is not None]
-        if es_dims_kl:
-            ax1.plot([d for d, _ in es_dims_kl], [k for _, k in es_dims_kl], marker='o', linewidth=2, markersize=8, label='Best ES')
-        if ppo_dims_kl:
-            ax1.plot([d for d, _ in ppo_dims_kl], [k for _, k in ppo_dims_kl], marker='s', linewidth=2, markersize=8, label='Best PPO')
-        ax1.set_xlabel('Dimension')
-        ax1.set_ylabel('KL Divergence (Total)')
-        ax1.set_title('Best KL Divergence Across Dimensions')
+        if es_x_kl:
+            ax1.plot(es_x_kl, es_y_kl, marker="o", linewidth=2, label="ES")
+        if ppo_x_kl:
+            ax1.plot(ppo_x_kl, ppo_y_kl, marker="s", linewidth=2, label="PPO")
+        ax1.set_title("Best KL (per-dim) vs Dimension")
+        ax1.set_xlabel("Dimension")
+        ax1.set_ylabel("KL (per-dim)")
+        ax1.grid(True, alpha=0.3)
         ax1.legend()
-        ax1.grid(True)
         
-        # Best Correlation per dimension (using score-based best configs)
+        # (2) Best MAE vs dim
         ax2 = fig.add_subplot(gs[0, 1])
-        es_corrs = []
-        ppo_corrs = []
-        for dim in dims:
-            results = self.all_results[dim]
-            has_es = len(results['ES']) > 0
-            has_ppo = len(results['PPO']) > 0
-            if has_es:
-                best_es = min(results['ES'], key=self._score_config)
-                es_corrs.append(best_es['correlation'])
-            else:
-                es_corrs.append(None)
-            if has_ppo:
-                best_ppo = min(results['PPO'], key=self._score_config)
-                ppo_corrs.append(best_ppo['correlation'])
-            else:
-                ppo_corrs.append(None)
-        
-        es_dims_corr = [(d, c) for d, c in zip(dims, es_corrs) if c is not None]
-        ppo_dims_corr = [(d, c) for d, c in zip(dims, ppo_corrs) if c is not None]
-        if es_dims_corr:
-            ax2.plot([d for d, _ in es_dims_corr], [c for _, c in es_dims_corr], marker='o', linewidth=2, markersize=8, label='Best ES')
-        if ppo_dims_corr:
-            ax2.plot([d for d, _ in ppo_dims_corr], [c for _, c in ppo_dims_corr], marker='s', linewidth=2, markersize=8, label='Best PPO')
-        ax2.set_xlabel('Dimension')
-        ax2.set_ylabel('Correlation')
-        ax2.set_title('Best Correlation Across Dimensions')
+        if es_x_mae:
+            ax2.plot(es_x_mae, es_y_mae, marker="o", linewidth=2, label="ES")
+        if ppo_x_mae:
+            ax2.plot(ppo_x_mae, ppo_y_mae, marker="s", linewidth=2, label="PPO")
+        ax2.set_title("Best MAE vs Dimension")
+        ax2.set_xlabel("Dimension")
+        ax2.set_ylabel("MAE")
+        ax2.grid(True, alpha=0.3)
         ax2.legend()
-        ax2.grid(True)
         
-        # Best MAE per dimension (using score-based best configs)
+        # (3) Best Corr vs dim
         ax3 = fig.add_subplot(gs[0, 2])
-        es_maes = []
-        ppo_maes = []
-        for dim in dims:
-            results = self.all_results[dim]
-            has_es = len(results['ES']) > 0
-            has_ppo = len(results['PPO']) > 0
-            if has_es:
-                best_es = min(results['ES'], key=self._score_config)
-                es_maes.append(best_es['mae'])
-            else:
-                es_maes.append(None)
-            if has_ppo:
-                best_ppo = min(results['PPO'], key=self._score_config)
-                ppo_maes.append(best_ppo['mae'])
-            else:
-                ppo_maes.append(None)
-        
-        es_dims_mae = [(d, m) for d, m in zip(dims, es_maes) if m is not None]
-        ppo_dims_mae = [(d, m) for d, m in zip(dims, ppo_maes) if m is not None]
-        if es_dims_mae:
-            ax3.plot([d for d, _ in es_dims_mae], [m for _, m in es_dims_mae], marker='o', linewidth=2, markersize=8, label='Best ES')
-        if ppo_dims_mae:
-            ax3.plot([d for d, _ in ppo_dims_mae], [m for _, m in ppo_dims_mae], marker='s', linewidth=2, markersize=8, label='Best PPO')
-        ax3.set_xlabel('Dimension')
-        ax3.set_ylabel('MAE')
-        ax3.set_title('Best MAE Across Dimensions')
+        if es_x_corr:
+            ax3.plot(es_x_corr, es_y_corr, marker="o", linewidth=2, label="ES")
+        if ppo_x_corr:
+            ax3.plot(ppo_x_corr, ppo_y_corr, marker="s", linewidth=2, label="PPO")
+        ax3.set_title("Best Correlation vs Dimension")
+        ax3.set_xlabel("Dimension")
+        ax3.set_ylabel("Correlation")
+        ax3.grid(True, alpha=0.3)
         ax3.legend()
-        ax3.grid(True)
         
-        # Win rate (using score-based selection)
+        # (4) Best MI/dim vs dim (using per-dim MI for cross-dimension comparison)
         ax4 = fig.add_subplot(gs[1, 0])
-        es_wins = 0
-        ppo_wins = 0
-        for dim in dims:
-            results = self.all_results[dim]
-            has_es = len(results['ES']) > 0
-            has_ppo = len(results['PPO']) > 0
-            if has_es and has_ppo:
-                best_es = min(results['ES'], key=self._score_config)
-                best_ppo = min(results['PPO'], key=self._score_config)
-                if self._score_config(best_es) < self._score_config(best_ppo):
-                    es_wins += 1
-                else:
-                    ppo_wins += 1
-            elif has_es:
-                es_wins += 1
-            elif has_ppo:
-                ppo_wins += 1
+        if es_x_mipd:
+            ax4.plot(es_x_mipd, es_y_mipd, marker="o", linewidth=2, label="ES")
+        if ppo_x_mipd:
+            ax4.plot(ppo_x_mipd, ppo_y_mipd, marker="s", linewidth=2, label="PPO")
+        ax4.set_title("Best Mutual Information per Dim vs Dimension")
+        ax4.set_xlabel("Dimension")
+        ax4.set_ylabel("MI / dim")
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
         
-        ax4.bar(['ES', 'PPO'], [es_wins, ppo_wins], color=['#1f77b4', '#ff7f0e'])
-        ax4.set_ylabel('Number of Wins')
-        ax4.set_title('Overall Win Count (by Score)')
-        ax4.grid(True, axis='y')
-        
-        # Best hyperparameters distribution - ES (using score-based selection)
+        # (5) Winner per dimension (categorical bar)
         ax5 = fig.add_subplot(gs[1, 1])
-        best_sigmas = []
-        best_es_lrs = []
-        es_dims = []
-        for dim in dims:
-            results = self.all_results[dim]
-            if len(results['ES']) > 0:
-                best_es = min(results['ES'], key=self._score_config)
-                best_sigmas.append(best_es['sigma'])
-                best_es_lrs.append(best_es['lr'])
-                es_dims.append(dim)
+        w_map = {"ES": 1, "PPO": -1, "NONE": 0}
+        y = [w_map[w] for w in winners]
+        ax5.bar([str(d) for d in dims], y, color=['#1f77b4' if w == "ES" else '#ff7f0e' if w == "PPO" else 'gray' for w in winners])
+        ax5.set_title("Winner per Dimension (ES=+1, PPO=-1)")
+        ax5.set_xlabel("Dimension")
+        ax5.set_ylabel("Winner")
+        ax5.axhline(0, linewidth=1, color='black')
+        ax5.grid(True, axis="y", alpha=0.3)
         
-        if best_sigmas:
-            ax5.scatter(best_sigmas, best_es_lrs, s=100, c=es_dims, cmap='viridis')
-        ax5.set_xlabel('Best Sigma')
-        ax5.set_ylabel('Best LR')
-        ax5.set_title('ES: Best Hyperparameters (colored by dimension)')
-        ax5.set_xscale('log')
-        ax5.set_yscale('log')
-        ax5.grid(True)
-        
-        # Best hyperparameters distribution - PPO (using score-based selection)
+        # (6) Scatter: KL vs MAE for best configs
         ax6 = fig.add_subplot(gs[1, 2])
-        best_kl_weights = []
-        best_ppo_lrs = []
-        ppo_dims = []
-        for dim in dims:
-            results = self.all_results[dim]
-            if len(results['PPO']) > 0:
-                best_ppo = min(results['PPO'], key=self._score_config)
-                best_kl_weights.append(best_ppo['kl_weight'])
-                best_ppo_lrs.append(best_ppo['lr'])
-                ppo_dims.append(dim)
+        for d in dims:
+            es = best_es.get(d)
+            if es is not None:
+                kl_val = _as_float(es.get("kl_div_total"), np.nan)
+                mae_val = _as_float(es.get("mae"), np.nan)
+                if np.isfinite(kl_val) and np.isfinite(mae_val):
+                    ax6.scatter(kl_val, mae_val, marker="o", s=100, alpha=0.6)
+                    ax6.text(kl_val, mae_val, f"ES {d}", fontsize=8)
+            ppo = best_ppo.get(d)
+            if ppo is not None:
+                kl_val = _as_float(ppo.get("kl_div_total"), np.nan)
+                mae_val = _as_float(ppo.get("mae"), np.nan)
+                if np.isfinite(kl_val) and np.isfinite(mae_val):
+                    ax6.scatter(kl_val, mae_val, marker="x", s=100, alpha=0.6)
+                    ax6.text(kl_val, mae_val, f"PPO {d}", fontsize=8)
+        ax6.set_title("Best Configs: KL vs MAE")
+        ax6.set_xlabel("KL (per-dim)")
+        ax6.set_ylabel("MAE")
+        ax6.grid(True, alpha=0.3)
         
-        if best_kl_weights:
-            ax6.scatter(best_kl_weights, best_ppo_lrs, s=100, c=ppo_dims, cmap='viridis')
-        ax6.set_xlabel('Best KL Weight')
-        ax6.set_ylabel('Best LR')
-        ax6.set_title('PPO: Best Hyperparameters (colored by dimension)')
-        ax6.set_yscale('log')
-        ax6.grid(True)
-        
-        plt.suptitle('Overall Ablation Study Comparison', fontsize=16, fontweight='bold')
+        plt.suptitle(f"Overall ES vs PPO Comparison | ES wins={es_wins}, PPO wins={ppo_wins}, none={none_wins}", 
+                     fontsize=14, fontweight="bold")
         plt.tight_layout()
         
-        plot_path = os.path.join(self.plots_dir, 'overall_comparison.png')
-        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plot_path = os.path.join(self.plots_dir, "overall_comparison.png")
+        plt.savefig(plot_path, dpi=150, bbox_inches="tight")
         plt.close()
         
-        print(f"Overall comparison plots saved: {plot_path}")
+        print(f"Overall comparison plot saved: {plot_path}")
         
-        # Log to wandb
         if self.config.use_wandb and WANDB_AVAILABLE:
-            wandb.log({'overall/comparison': wandb.Image(plot_path)})
+            wandb.log({"overall/overall_comparison": wandb.Image(plot_path)})
 
 
 # ============================================================================
