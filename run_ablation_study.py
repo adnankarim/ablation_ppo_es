@@ -493,7 +493,10 @@ class MultiDimMLP(nn.Module):
         )
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, t_scale: float, condition: torch.Tensor = None) -> torch.Tensor:
-        t_norm = t.float().unsqueeze(-1) / t_scale
+        # CRITICAL: Ensure t_norm matches model dtype (float32) to avoid dtype mismatch errors
+        # Division can promote to float64, so explicitly cast to model dtype
+        t_norm = t.float().unsqueeze(-1) / float(t_scale)
+        t_norm = t_norm.to(self.time_embed[0].weight.dtype)
         t_emb = self.time_embed(t_norm)
         inp = torch.cat([x, t_emb], dim=-1)
         return self.net(inp)
@@ -526,7 +529,10 @@ class ConditionalMultiDimMLP(nn.Module):
         )
     
     def forward(self, x: torch.Tensor, t: torch.Tensor, t_scale: float, condition: torch.Tensor = None) -> torch.Tensor:
-        t_norm = t.float().unsqueeze(-1) / t_scale
+        # CRITICAL: Ensure t_norm matches model dtype (float32) to avoid dtype mismatch errors
+        # Division can promote to float64, so explicitly cast to model dtype
+        t_norm = t.float().unsqueeze(-1) / float(t_scale)
+        t_norm = t_norm.to(self.time_embed[0].weight.dtype)
         t_emb = self.time_embed(t_norm)
         
         if condition is None:
@@ -1757,6 +1763,23 @@ class AblationRunner:
     
     def _pretrain_ddpm(self, dim: int) -> Tuple[MultiDimDDPM, MultiDimDDPM]:
         """Pretrain DDPM models for X1 and X2."""
+        # Helper: closed-form 1D Gaussian KL for diagnostics during pretraining
+        def _gaussian_kl_1d(mu: float, var: float, target_mu: float, target_var: float) -> float:
+            """KL( N(mu, var) || N(target_mu, target_var) ) for 1D Gaussians.
+            
+            Used purely for pretraining sanity checks; not part of ablation metrics.
+            """
+            var = max(float(var), 1e-8)
+            target_var = max(float(target_var), 1e-8)
+            mu = float(mu)
+            target_mu = float(target_mu)
+            return 0.5 * (
+                var / target_var
+                + (mu - target_mu) ** 2 / target_var
+                - 1.0
+                + math.log(target_var / var)
+            )
+
         # Check if models already exist in persistent directory
         # CRITICAL: Include timesteps and hidden_dim in filename to prevent cache collisions
         # Extended tag includes beta schedule to prevent cache collisions
@@ -1808,8 +1831,94 @@ class AblationRunner:
                     loss = ddpm_x1.train_step(x)
                     losses.append(loss)
                 
-                if (epoch + 1) % 20 == 0:
-                    print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {np.mean(losses):.4f}")
+                avg_loss = float(np.mean(losses)) if losses else float("nan")
+                
+                # Lightweight console logging
+                if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
+                    print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
+
+                    # === Pretraining diagnostics: samples, stats, KL, histograms ===
+                    try:
+                        with torch.no_grad():
+                            # Use smaller N in low dims, larger in high dims
+                            num_samples = 2000 if dim < 20 else 5000
+                            samples = ddpm_x1.sample(num_samples)
+                            samples_cpu = samples.detach().cpu()
+
+                        # Aggregate scalar stats over all dims/samples for easy plotting
+                        mean_val = float(samples_cpu.mean().item())
+                        var_val = float(samples_cpu.var(unbiased=False).item())
+                        std_val = float(math.sqrt(max(var_val, 0.0)))
+
+                        # Target for X1: N(2, sqrt(0.99)) to match eval distribution
+                        target_mu1 = 2.0
+                        target_std1 = math.sqrt(0.99)
+                        target_var1 = target_std1 ** 2
+                        kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu1, target_var1))
+
+                        # Optional: noise prediction MSE on a held-out batch (diagnostic only)
+                        with torch.no_grad():
+                            if "x" in locals():
+                                eval_x = x
+                                bsz = eval_x.shape[0]
+                                t_eval = torch.randint(0, ddpm_x1.timesteps, (bsz,), device=self.config.device)
+                                noise_eval = torch.randn_like(eval_x)
+                                x_t_eval = ddpm_x1.q_sample(eval_x, t_eval, noise_eval)
+                                noise_pred = ddpm_x1.model(x_t_eval, t_eval, ddpm_x1.t_scale)
+                                noise_mse = float(nn.functional.mse_loss(noise_pred, noise_eval).item())
+                            else:
+                                noise_mse = float("nan")
+
+                        # WandB logging (namespaced under pretrain_x1/*)
+                        if self.config.use_wandb and WANDB_AVAILABLE:
+                            wandb.log(
+                                {
+                                    "pretrain_x1/loss": avg_loss,
+                                    "pretrain_x1/sample_mean": mean_val,
+                                    "pretrain_x1/sample_std": std_val,
+                                    "pretrain_x1/sample_var": var_val,
+                                    "pretrain_x1/kl_to_target": kl_val,
+                                    "pretrain_x1/noise_mse": noise_mse,
+                                    "pretrain_x1/epoch": epoch + 1,
+                                    "pretrain_x1/dim": dim,
+                                }
+                            )
+                            # Histogram of samples
+                            wandb.log(
+                                {
+                                    "pretrain_x1/sample_hist": wandb.Histogram(
+                                        samples_cpu.numpy().flatten()
+                                    )
+                                }
+                            )
+
+                        # Local histogram plot for reviewer-friendly sanity checks
+                        try:
+                            pretrain_dir = os.path.join(self.plots_dir, f"pretrain_{dim}d")
+                            os.makedirs(pretrain_dir, exist_ok=True)
+                            hist_path = os.path.join(
+                                pretrain_dir, f"ddpm_x1_hist_epoch_{epoch+1}.png"
+                            )
+                            plt.figure()
+                            plt.hist(
+                                samples_cpu.numpy().flatten(),
+                                bins=100,
+                                density=True,
+                                alpha=0.8,
+                            )
+                            plt.title(f"DDPM X1 Pretrain Samples (dim={dim}, epoch={epoch+1})")
+                            plt.xlabel("x1")
+                            plt.ylabel("density")
+                            plt.tight_layout()
+                            plt.savefig(hist_path, dpi=120, bbox_inches="tight")
+                            plt.close()
+
+                            if self.config.use_wandb and WANDB_AVAILABLE:
+                                wandb.log({"pretrain_x1/sample_hist_plot": wandb.Image(hist_path)})
+                        except Exception as e:
+                            print(f"    [DDPM X1] Pretrain diagnostics plotting failed: {e}")
+                    except Exception as e:
+                        print(f"    [DDPM X1] Pretrain diagnostics failed: {e}")
             
             ddpm_x1.save(model_x1_path)
             print(f"  [SAVE] Saved DDPM X1 to {model_x1_path}")
@@ -1851,8 +1960,90 @@ class AblationRunner:
                     loss = ddpm_x2.train_step(x)
                     losses.append(loss)
                 
-                if (epoch + 1) % 20 == 0:
-                    print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {np.mean(losses):.4f}")
+                avg_loss = float(np.mean(losses)) if losses else float("nan")
+                
+                # Lightweight console logging
+                if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
+                    print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
+
+                    # === Pretraining diagnostics: samples, stats, KL, histograms ===
+                    try:
+                        with torch.no_grad():
+                            num_samples = 2000 if dim < 20 else 5000
+                            samples = ddpm_x2.sample(num_samples)
+                            samples_cpu = samples.detach().cpu()
+
+                        mean_val = float(samples_cpu.mean().item())
+                        var_val = float(samples_cpu.var(unbiased=False).item())
+                        std_val = float(math.sqrt(max(var_val, 0.0)))
+
+                        # Target for X2: N(10, 1.0)
+                        target_mu2 = 10.0
+                        target_std2 = 1.0
+                        target_var2 = target_std2 ** 2
+                        kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu2, target_var2))
+
+                        # Optional noise prediction MSE (diagnostic only)
+                        with torch.no_grad():
+                            if "x" in locals():
+                                eval_x = x
+                                bsz = eval_x.shape[0]
+                                t_eval = torch.randint(0, ddpm_x2.timesteps, (bsz,), device=self.config.device)
+                                noise_eval = torch.randn_like(eval_x)
+                                x_t_eval = ddpm_x2.q_sample(eval_x, t_eval, noise_eval)
+                                noise_pred = ddpm_x2.model(x_t_eval, t_eval, ddpm_x2.t_scale)
+                                noise_mse = float(nn.functional.mse_loss(noise_pred, noise_eval).item())
+                            else:
+                                noise_mse = float("nan")
+
+                        if self.config.use_wandb and WANDB_AVAILABLE:
+                            wandb.log(
+                                {
+                                    "pretrain_x2/loss": avg_loss,
+                                    "pretrain_x2/sample_mean": mean_val,
+                                    "pretrain_x2/sample_std": std_val,
+                                    "pretrain_x2/sample_var": var_val,
+                                    "pretrain_x2/kl_to_target": kl_val,
+                                    "pretrain_x2/noise_mse": noise_mse,
+                                    "pretrain_x2/epoch": epoch + 1,
+                                    "pretrain_x2/dim": dim,
+                                }
+                            )
+                            wandb.log(
+                                {
+                                    "pretrain_x2/sample_hist": wandb.Histogram(
+                                        samples_cpu.numpy().flatten()
+                                    )
+                                }
+                            )
+
+                        # Local histogram plot
+                        try:
+                            pretrain_dir = os.path.join(self.plots_dir, f"pretrain_{dim}d")
+                            os.makedirs(pretrain_dir, exist_ok=True)
+                            hist_path = os.path.join(
+                                pretrain_dir, f"ddpm_x2_hist_epoch_{epoch+1}.png"
+                            )
+                            plt.figure()
+                            plt.hist(
+                                samples_cpu.numpy().flatten(),
+                                bins=100,
+                                density=True,
+                                alpha=0.8,
+                            )
+                            plt.title(f"DDPM X2 Pretrain Samples (dim={dim}, epoch={epoch+1})")
+                            plt.xlabel("x2")
+                            plt.ylabel("density")
+                            plt.tight_layout()
+                            plt.savefig(hist_path, dpi=120, bbox_inches="tight")
+                            plt.close()
+
+                            if self.config.use_wandb and WANDB_AVAILABLE:
+                                wandb.log({"pretrain_x2/sample_hist_plot": wandb.Image(hist_path)})
+                        except Exception as e:
+                            print(f"    [DDPM X2] Pretrain diagnostics plotting failed: {e}")
+                    except Exception as e:
+                        print(f"    [DDPM X2] Pretrain diagnostics failed: {e}")
             
             ddpm_x2.save(model_x2_path)
             print(f"  [SAVE] Saved DDPM X2 to {model_x2_path}")
