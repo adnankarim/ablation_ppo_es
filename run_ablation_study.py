@@ -1775,8 +1775,8 @@ class AblationRunner:
         # Generate training data - UNPAIRED (same as PPO for fair comparison)
         # ES now uses same unpaired objective as PPO: J(θ) = E[reward] - λ*KL
         # Both methods optimize identical objective on identical data regime
-        x1_data = torch.randn(self.config.coupling_num_samples, dim, device=self.config.device) * 1.0 + 2.0
-        x2_data = torch.randn(self.config.coupling_num_samples, dim, device=self.config.device) * 1.0 + 10.0  # UNPAIRED marginals
+        # NOTE: We don't pre-allocate x1_data/x2_data here - ES samples batches on-the-fly to save VRAM
+        # (especially important in high-D runs like 30D+)
         
         # No dataloader needed - ES samples batches on-the-fly (like PPO)
         
