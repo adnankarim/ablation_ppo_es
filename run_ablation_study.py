@@ -2915,7 +2915,7 @@ class AblationRunner:
             epoch_metrics.append(metrics)
             
             # Generate checkpoint plot every epoch for better observability
-            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', dim, f'σ={sigma}, lr={lr}')
+                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', dim, f'σ={sigma}, lr={lr}')
             
             # Log to wandb (include all key metrics)
             if self.config.use_wandb and WANDB_AVAILABLE:
@@ -3136,7 +3136,7 @@ class AblationRunner:
             epoch_metrics.append(metrics)
             
             # Generate checkpoint plot every epoch for better observability
-            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
+                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
             
             # Log to wandb (include all key metrics)
             if self.config.use_wandb and WANDB_AVAILABLE:
