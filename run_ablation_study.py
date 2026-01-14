@@ -1843,7 +1843,7 @@ class AblationRunner:
         initial_metrics['phase'] = 'initial'
         epoch_metrics.append(initial_metrics)
         
-        print(f"    Initial: KL/dim={initial_metrics['kl_div_total']:.4f}, "
+        print(f"    Initial: KL(sum_per_dim)={initial_metrics['kl_div_total']:.4f}, "
               f"MI={initial_metrics['mutual_information']:.4f}, "
               f"Corr={initial_metrics['correlation']:.4f}")
         
@@ -2068,7 +2068,7 @@ class AblationRunner:
         initial_metrics['phase'] = 'initial'
         epoch_metrics.append(initial_metrics)
         
-        print(f"    Initial: KL/dim={initial_metrics['kl_div_total']:.4f}, "
+        print(f"    Initial: KL(sum_per_dim)={initial_metrics['kl_div_total']:.4f}, "
               f"MI={initial_metrics['mutual_information']:.4f}, "
               f"Corr={initial_metrics['correlation']:.4f}")
         
