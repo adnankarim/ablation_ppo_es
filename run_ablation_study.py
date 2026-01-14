@@ -413,10 +413,10 @@ class AblationConfig:
     
     # DDPM pretraining (use pretrained models)
     ddpm_epochs: int = 3000
-    ddpm_lr: float = 1e-3
+    ddpm_lr: float = 2e-2  # Increased significantly to scale across dimensions
     ddpm_batch_size: int = 2048  # Increased for maximum memory usage
     ddpm_timesteps: int = 100  # Reduced from 1000 for PPO feasibility
-    ddpm_hidden_dim: int = 128
+    ddpm_hidden_dim: int = 512  # Increased model capacity to scale across dimensions
     ddpm_num_samples: int = 500000  # Increased for maximum memory usage
     
     # Coupling training
