@@ -290,8 +290,10 @@ class InformationMetrics:
         mi_21 = max(0, h_x2_true + h_x1 - h_joint_21)  # I(X2_true; X1_gen)
         mi_12 = max(0, h_x1_true + h_x2 - h_joint_12)  # I(X1_true; X2_gen)
         
-        # Mutual Information - symmetric true->generated MI (consistent with conditional entropy terms)
-        # This measures how well the conditional models learned the coupling
+        # NOTE: This is a hybrid "true ↔ generated" MI proxy, not standard joint MI
+        # mi_21 = I(X2_true; X1_gen), mi_12 = I(X1_true; X2_gen)
+        # This measures dependence between true and generated samples (useful for coupling quality)
+        # Symmetric MI (average of both directions) - proxy for true↔generated coupling
         mutual_info = 0.5 * (mi_21 + mi_12)
         
         # Clamp MI to reasonable range (per dimension): [0, 6*dim] 
@@ -1392,6 +1394,12 @@ class DDMECPPOTrainer:
 
         # 3) PPO epochs
         self.actor.model.train()
+        ppo_obj_val = 0.0
+        anchor_kl_val = 0.0
+        ratio_mean = 0.0
+        ratio_max = 0.0
+        clipped_frac = 0.0
+        
         for _ in range(self.ppo_epochs):
             if self.actor.conditional:
                 eps_new = self.actor.model(X_t, T_t, self.actor.t_scale, cond_rep)
@@ -1417,11 +1425,23 @@ class DDMECPPOTrainer:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.model.parameters(), 1.0)
             self.opt.step()
+            
+            # Track stats for logging (use last epoch's values)
+            ppo_obj_val = float(ppo_obj.item())
+            anchor_kl_val = float(anchor_kl.item())
+            ratio_mean = float(ratio.mean().item())
+            ratio_max = float(ratio.max().item())
+            clipped_frac = float(((ratio < (1.0 - self.clip_eps)) | (ratio > (1.0 + self.clip_eps))).float().mean().item())
 
         return {
             "loss": float(loss.item()),
             "reward_mean": float(reward.mean().item()),
             "reward_std": float(reward.std().item()),
+            "ppo_obj": ppo_obj_val,  # PPO objective value
+            "anchor_kl": anchor_kl_val,  # Anchor KL penalty
+            "ratio_mean": ratio_mean,  # Mean importance ratio
+            "ratio_max": ratio_max,  # Max importance ratio (for detecting instability)
+            "ratio_clipped_frac": clipped_frac,  # Fraction of ratios that were clipped
         }
 
 
