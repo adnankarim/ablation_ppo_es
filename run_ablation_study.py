@@ -293,31 +293,34 @@ class InformationMetrics:
             
             # Independent joint entropy (theoretical bound if X and Y were independent)
             h_independent_joint = h_x1_true + h_x2_true
-        
-        mi_21 = max(0, h_x2_true + h_x1 - h_joint_21)  # I(X2_true; X1_gen)
-        mi_12 = max(0, h_x1_true + h_x2 - h_joint_12)  # I(X1_true; X2_gen)
-        
-        # NOTE: This is a hybrid "true ↔ generated" MI proxy, not standard joint MI
-        # mi_21 = I(X2_true; X1_gen), mi_12 = I(X1_true; X2_gen)
-        # This measures dependence between true and generated samples (useful for coupling quality)
-        # Symmetric MI (average of both directions) - proxy for true↔generated coupling
-        mutual_info = 0.5 * (mi_21 + mi_12)
-        
-        # Clamp MI to reasonable range (per dimension): [0, 6*dim] 
-        # For independent: MI ≈ 0, for fully dependent: MI ≈ H(X)
-        mutual_info = float(np.clip(mutual_info, 0.0, 6.0 * dim))
-        
-        # Also compute gen->gen MI for reference (optional, kept for backward compatibility)
-        h_joint_gen = InformationMetrics.joint_entropy_from_samples(x1_gen, x2_gen)
-        mi_gen_gen = max(0, h_x1 + h_x2 - h_joint_gen)
-        mi_gen_gen = float(np.clip(mi_gen_gen, 0.0, 6.0 * dim))
-        
-        # Conditional Entropy H(X|Y) = H(X,Y) - H(Y)
-        h_x1_given_x2 = max(0, h_joint_21 - h_x2_true)
-        h_x2_given_x1 = max(0, h_joint_12 - h_x1_true)
-        
-        # Theoretical bounds
-        h_theoretical = InformationMetrics.entropy_multidim_gaussian(np.eye(dim) * (target_std ** 2))
+            
+            # Directional MI - measures conditional generation quality
+            # I(X;Y) = H(X) + H(Y) - H(X,Y)
+            # I(X2_true; X1_gen) measures how much X2_true tells us about X1_gen
+            mi_21 = max(0, h_x2_true + h_x1 - h_joint_21)  # I(X2_true; X1_gen)
+            mi_12 = max(0, h_x1_true + h_x2 - h_joint_12)  # I(X1_true; X2_gen)
+            
+            # NOTE: This is a hybrid "true ↔ generated" MI proxy, not standard joint MI
+            # mi_21 = I(X2_true; X1_gen), mi_12 = I(X1_true; X2_gen)
+            # This measures dependence between true and generated samples (useful for coupling quality)
+            # Symmetric MI (average of both directions) - proxy for true↔generated coupling
+            mutual_info = 0.5 * (mi_21 + mi_12)
+            
+            # Clamp MI to reasonable range (per dimension): [0, 6*dim] 
+            # For independent: MI ≈ 0, for fully dependent: MI ≈ H(X)
+            mutual_info = float(np.clip(mutual_info, 0.0, 6.0 * dim))
+            
+            # Also compute gen->gen MI for reference (optional, kept for backward compatibility)
+            h_joint_gen = InformationMetrics.joint_entropy_from_samples(x1_gen, x2_gen)
+            mi_gen_gen = max(0, h_x1 + h_x2 - h_joint_gen)
+            mi_gen_gen = float(np.clip(mi_gen_gen, 0.0, 6.0 * dim))
+            
+            # Conditional Entropy H(X|Y) = H(X,Y) - H(Y)
+            h_x1_given_x2 = max(0, h_joint_21 - h_x2_true)
+            h_x2_given_x1 = max(0, h_joint_12 - h_x1_true)
+            
+            # Theoretical bounds
+            h_theoretical = InformationMetrics.entropy_multidim_gaussian(np.eye(dim) * (target_std ** 2))
         
         # Correlation
         corrs = []
