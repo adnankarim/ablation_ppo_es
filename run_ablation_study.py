@@ -1950,11 +1950,11 @@ class AblationRunner:
                 })
             
             if (epoch + 1) % 3 == 0:
-                print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL/dim={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
+                print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
             
             # Early stopping if ES diverges (100 per dim is very high)
             if metrics['kl_div_total'] > 100 or not np.isfinite(metrics['kl_div_total']):
-                print(f"    [ERROR] ES diverged (KL/dim={metrics['kl_div_total']:.2e}), stopping early at epoch {epoch+1}")
+                print(f"    [ERROR] ES diverged (KL(sum_per_dim)={metrics['kl_div_total']:.2e}), stopping early at epoch {epoch+1}")
                 break
         
         # Final evaluation
@@ -2051,11 +2051,10 @@ class AblationRunner:
         # Training loop
         epoch_metrics = []
         
-        # Generate frozen eval set for consistent evaluation across epochs
-        # Increase samples for high dims to stabilize MI estimation (30D needs more samples for 60D Gaussian)
-        num_eval = 5000 if dim >= 20 else 1000
-        eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
-        eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
+        # IMPORTANT: use the frozen eval set passed from run()
+        # (do NOT regenerate here, otherwise configs aren't comparable)
+        assert eval_x1_true is not None and eval_x2_true is not None
+        assert eval_x1_true.shape[0] == eval_x2_true.shape[0]
         
         # Evaluate INITIAL state (epoch 0)
         print(f"    Evaluating initial state (before PPO training)...")
@@ -2145,7 +2144,7 @@ class AblationRunner:
                 })
             
             if (epoch + 1) % 3 == 0:
-                print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL/dim={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
+                print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
         
         # Final evaluation
         final_metrics = epoch_metrics[-1]
@@ -2494,7 +2493,7 @@ Latest Metrics (Epoch {latest['epoch']}):
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 Primary:
   Loss:         {latest['loss']:.4f}
-  KL/dim:       {latest['kl_div_total']:.4f}
+  KL(sum_per_dim): {latest['kl_div_total']:.4f}
   Correlation:  {latest['correlation']:.4f}
   MAE:          {latest['mae']:.4f}
 
@@ -2993,9 +2992,17 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
             wandb.log({f'{dim}D/ablation_plots': wandb.Image(plot_path)})
     
     def _generate_overall_summary(self):
-        """Generate overall summary across all dimensions."""
-        summary_path = os.path.join(self.output_dir, "OVERALL_SUMMARY.txt")
+        """Generate overall summary across all dimensions (improved with CSV and plots)."""
+        import csv
         
+        summary_path = os.path.join(self.output_dir, "OVERALL_SUMMARY.txt")
+        csv_path = os.path.join(self.output_dir, "overall_best_configs.csv")
+        plot_path = os.path.join(self.output_dir, "overall_best_comparison.png")
+
+        rows = []
+        es_wins = 0
+        ppo_wins = 0
+
         with open(summary_path, 'w') as f:
             f.write("="*100 + "\n")
             f.write("COMPREHENSIVE ABLATION STUDY: OVERALL SUMMARY\n")
@@ -3004,74 +3011,167 @@ PPO Best Config (kl_w={best_ppo['kl_weight']:.1e}, clip={best_ppo['ppo_clip']}, 
             f.write(f"Output Directory: {self.output_dir}\n")
             f.write(f"Dimensions: {self.config.dimensions}\n")
             f.write("="*100 + "\n\n")
-            
-            # Best configurations per dimension
-            f.write("BEST CONFIGURATIONS PER DIMENSION:\n")
+
+            f.write("BEST CONFIGURATIONS PER DIMENSION (selected by composite score):\n")
             f.write("-"*100 + "\n\n")
-            
+
             for dim in sorted(self.all_results.keys()):
                 results = self.all_results[dim]
-                has_es = len(results['ES']) > 0
-                has_ppo = len(results['PPO']) > 0
-                
+                has_es = len(results.get('ES', [])) > 0
+                has_ppo = len(results.get('PPO', [])) > 0
+
                 best_es = min(results['ES'], key=self._score_config) if has_es else None
                 best_ppo = min(results['PPO'], key=self._score_config) if has_ppo else None
-                
+
+                # decide winner
+                if has_es and has_ppo:
+                    winner = "ES" if self._score_config(best_es) < self._score_config(best_ppo) else "PPO"
+                    es_wins += int(winner == "ES")
+                    ppo_wins += int(winner == "PPO")
+                elif has_es:
+                    winner = "ES"
+                    es_wins += 1
+                elif has_ppo:
+                    winner = "PPO"
+                    ppo_wins += 1
+                else:
+                    winner = "NONE"
+
                 f.write(f"{dim}D:\n")
                 if has_es:
-                    f.write(f"  ES  - sigma={best_es['sigma']:<6.4f} lr={best_es['lr']:<8.6f} "
-                           f"KL={best_es['kl_div_total']:<8.4f} Corr={best_es['correlation']:<6.4f} MAE={best_es['mae']:<6.4f}\n")
+                    f.write(
+                        f"  ES  - sigma={best_es['sigma']:<8.4f} lr={best_es['lr']:<10.6f} "
+                        f"score={self._score_config(best_es):<10.4f} "
+                        f"MAE={best_es.get('mae', float('nan')):<8.4f} "
+                        f"Corr={best_es.get('correlation', float('nan')):<8.4f} "
+                        f"MI={best_es.get('mutual_information', float('nan')):<10.4f} "
+                        f"KLsum(per-dim)={best_es.get('kl_div_total', float('nan')):<10.4f}\n"
+                    )
                 else:
-                    f.write(f"  ES  - (skipped --only-method PPO)\n")
+                    f.write("  ES  - (not run)\n")
+
                 if has_ppo:
-                    f.write(f"  PPO - kl_w={best_ppo['kl_weight']:<6.1e} clip={best_ppo['ppo_clip']:<6.2f} "
-                           f"lr={best_ppo['lr']:<8.6f} KL={best_ppo['kl_div_total']:<8.4f} Corr={best_ppo['correlation']:<6.4f} MAE={best_ppo['mae']:<6.4f}\n")
+                    f.write(
+                        f"  PPO - kl_w={best_ppo['kl_weight']:<8.1e} clip={best_ppo['ppo_clip']:<6.2f} "
+                        f"lr={best_ppo['lr']:<10.6f} score={self._score_config(best_ppo):<10.4f} "
+                        f"MAE={best_ppo.get('mae', float('nan')):<8.4f} "
+                        f"Corr={best_ppo.get('correlation', float('nan')):<8.4f} "
+                        f"MI={best_ppo.get('mutual_information', float('nan')):<10.4f} "
+                        f"KLsum(per-dim)={best_ppo.get('kl_div_total', float('nan')):<10.4f}\n"
+                    )
                 else:
-                    f.write(f"  PPO - (skipped --only-method ES)\n")
-                if has_es and has_ppo:
-                    f.write(f"  WINNER: {'ES' if self._score_config(best_es) < self._score_config(best_ppo) else 'PPO'}\n\n")
-                elif has_es:
-                    f.write(f"  WINNER: ES (only method run)\n\n")
-                elif has_ppo:
-                    f.write(f"  WINNER: PPO (only method run)\n\n")
-                else:
-                    f.write(f"  WINNER: (no methods run)\n\n")
-            
-            # Overall statistics
+                    f.write("  PPO - (not run)\n")
+
+                f.write(f"  WINNER: {winner}\n\n")
+
+                # record CSV row (one per dim)
+                rows.append({
+                    "dim": dim,
+                    "winner": winner,
+
+                    "es_sigma": None if not has_es else best_es.get("sigma"),
+                    "es_lr": None if not has_es else best_es.get("lr"),
+                    "es_score": None if not has_es else self._score_config(best_es),
+                    "es_mae": None if not has_es else best_es.get("mae"),
+                    "es_corr": None if not has_es else best_es.get("correlation"),
+                    "es_mi": None if not has_es else best_es.get("mutual_information"),
+                    "es_mi_per_dim": None if not has_es else best_es.get("mutual_information_per_dim", (best_es.get("mutual_information", 0.0) / dim)),
+                    "es_kl_sum_per_dim": None if not has_es else best_es.get("kl_div_total"),
+
+                    "ppo_kl_weight": None if not has_ppo else best_ppo.get("kl_weight"),
+                    "ppo_clip": None if not has_ppo else best_ppo.get("ppo_clip"),
+                    "ppo_lr": None if not has_ppo else best_ppo.get("lr"),
+                    "ppo_score": None if not has_ppo else self._score_config(best_ppo),
+                    "ppo_mae": None if not has_ppo else best_ppo.get("mae"),
+                    "ppo_corr": None if not has_ppo else best_ppo.get("correlation"),
+                    "ppo_mi": None if not has_ppo else best_ppo.get("mutual_information"),
+                    "ppo_mi_per_dim": None if not has_ppo else best_ppo.get("mutual_information_per_dim", (best_ppo.get("mutual_information", 0.0) / dim)),
+                    "ppo_kl_sum_per_dim": None if not has_ppo else best_ppo.get("kl_div_total"),
+                })
+
             f.write("\n" + "="*100 + "\n")
             f.write("OVERALL STATISTICS:\n")
             f.write("="*100 + "\n\n")
-            
-            es_wins = 0
-            ppo_wins = 0
-            
-            for dim in self.all_results.keys():
-                results = self.all_results[dim]
-                has_es = len(results['ES']) > 0
-                has_ppo = len(results['PPO']) > 0
-                
-                if has_es and has_ppo:
-                    best_es = min(results['ES'], key=self._score_config)
-                    best_ppo = min(results['PPO'], key=self._score_config)
-                    if self._score_config(best_es) < self._score_config(best_ppo):
-                        es_wins += 1
-                    else:
-                        ppo_wins += 1
-                elif has_es:
-                    es_wins += 1
-                elif has_ppo:
-                    ppo_wins += 1
-            
-            f.write(f"ES Wins: {es_wins}/{len(self.all_results)} dimensions\n")
-            f.write(f"PPO Wins: {ppo_wins}/{len(self.all_results)} dimensions\n\n")
-            
-            f.write(f"OVERALL WINNER: {'ES' if es_wins > ppo_wins else 'PPO'}\n")
-            
-            f.write("\n" + "="*100 + "\n")
-            f.write("END OF SUMMARY\n")
-            f.write("="*100 + "\n")
-        
-        print(f"Overall summary saved: {summary_path}")
+            f.write(f"ES wins:  {es_wins}\n")
+            f.write(f"PPO wins: {ppo_wins}\n")
+            f.write(f"Total dims evaluated: {len(self.all_results.keys())}\n")
+
+        # Save CSV
+        if rows:
+            fieldnames = list(rows[0].keys())
+            with open(csv_path, "w", newline="") as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for r in rows:
+                    writer.writerow(r)
+            print(f"[OVERALL] Best-config CSV saved: {csv_path}")
+
+        # Plot (best ES vs best PPO over dimensions)
+        try:
+            dims = [r["dim"] for r in rows]
+
+            def series(key):
+                return [r[key] if r[key] is not None else np.nan for r in rows]
+
+            es_mae = series("es_mae")
+            ppo_mae = series("ppo_mae")
+            es_corr = series("es_corr")
+            ppo_corr = series("ppo_corr")
+            es_mi_pd = series("es_mi_per_dim")
+            ppo_mi_pd = series("ppo_mi_per_dim")
+            es_kl = series("es_kl_sum_per_dim")
+            ppo_kl = series("ppo_kl_sum_per_dim")
+
+            fig = plt.figure(figsize=(18, 10))
+
+            ax1 = fig.add_subplot(2, 2, 1)
+            ax1.plot(dims, es_mae, marker="o", label="ES")
+            ax1.plot(dims, ppo_mae, marker="o", label="PPO")
+            ax1.set_title("Best MAE vs Dimension (lower is better)")
+            ax1.set_xlabel("Dimension")
+            ax1.set_ylabel("MAE")
+            ax1.grid(True, alpha=0.3)
+            ax1.legend()
+
+            ax2 = fig.add_subplot(2, 2, 2)
+            ax2.plot(dims, es_corr, marker="o", label="ES")
+            ax2.plot(dims, ppo_corr, marker="o", label="PPO")
+            ax2.set_title("Best Correlation vs Dimension (higher is better)")
+            ax2.set_xlabel("Dimension")
+            ax2.set_ylabel("Correlation")
+            ax2.grid(True, alpha=0.3)
+            ax2.legend()
+
+            ax3 = fig.add_subplot(2, 2, 3)
+            ax3.plot(dims, es_mi_pd, marker="o", label="ES")
+            ax3.plot(dims, ppo_mi_pd, marker="o", label="PPO")
+            ax3.set_title("Best Mutual Information per-dim vs Dimension (higher is better)")
+            ax3.set_xlabel("Dimension")
+            ax3.set_ylabel("MI / dim")
+            ax3.grid(True, alpha=0.3)
+            ax3.legend()
+
+            ax4 = fig.add_subplot(2, 2, 4)
+            ax4.plot(dims, es_kl, marker="o", label="ES")
+            ax4.plot(dims, ppo_kl, marker="o", label="PPO")
+            ax4.set_title("Best KL sum(per-dim) vs Dimension (lower is better)")
+            ax4.set_xlabel("Dimension")
+            ax4.set_ylabel("KL1_per_dim + KL2_per_dim")
+            ax4.grid(True, alpha=0.3)
+            ax4.legend()
+
+            plt.tight_layout()
+            plt.savefig(plot_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"[OVERALL] Best-config plot saved: {plot_path}")
+
+            if self.config.use_wandb and WANDB_AVAILABLE:
+                wandb.log({"overall/best_comparison": wandb.Image(plot_path)})
+
+        except Exception as e:
+            print(f"[OVERALL] Plotting failed: {e}")
+
+        print(f"[OVERALL] Summary saved: {summary_path}")
         
         # Save results to JSON
         json_path = os.path.join(self.output_dir, "all_results.json")
