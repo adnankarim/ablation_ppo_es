@@ -2336,12 +2336,15 @@ class AblationRunner:
                 }
             
             # Compute metrics (pass fast flag to skip expensive MI/entropy during training)
+            # CRITICAL: Use separate target stds to match eval distribution
             metrics = InformationMetrics.compute_all_metrics(
                 x1_gen_np,
                 x2_gen_np,
                 x1_true_np,
                 x2_true_np,
                 dim=dim,
+                target_std1=np.sqrt(0.99),  # x1_true std = sqrt(0.99)
+                target_std2=1.0,  # x2_true std = 1.0
                 fast=fast
             )
             
