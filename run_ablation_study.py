@@ -1887,7 +1887,8 @@ class AblationRunner:
             hidden_dim=self.config.ddpm_hidden_dim,
             lr=lr,  # Use ES LR directly
             device=self.config.device,
-            conditional=True
+            conditional=True,
+            create_optimizer=False  # ES doesn't use MultiDimDDPM's optimizer
         )
         # Apply smart loading with RANDOM init for ES (same as PPO - needed for reward signal)
         # ES now uses same contrastive reward as PPO, so needs non-zero conditioning weights
