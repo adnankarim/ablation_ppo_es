@@ -1569,6 +1569,13 @@ class AblationRunner:
             print(f"[{dim}D] Step 1: Pretraining DDPM...")
             ddpm_x1, ddpm_x2 = self._pretrain_ddpm(dim)
             
+            # CRITICAL: Create single frozen eval set per dimension (shared across all configs)
+            # This ensures fair comparison - all configs evaluated on identical test data
+            num_eval = 5000 if dim >= 20 else 1000
+            eval_x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
+            eval_x2_true = eval_x1_true + 8.0 + 0.1 * torch.randn_like(eval_x1_true)
+            print(f"  [EVAL] Created frozen eval set: {num_eval} samples (shared across all configs)")
+            
             # ES Ablations
             if hasattr(self.config, 'only_method') and self.config.only_method == "PPO":
                 print(f"\n[{dim}D] Step 2: ES Ablations... SKIPPED (--only-method PPO)")
