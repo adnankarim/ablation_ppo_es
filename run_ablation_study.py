@@ -418,7 +418,7 @@ class AblationConfig:
     ddpm_batch_size: int = 2048  # Increased for maximum memory usage
     ddpm_timesteps: int = 100  # Reduced from 1000 for PPO feasibility
     ddpm_hidden_dim: int = 512  # Increased model capacity to scale across dimensions
-    ddpm_num_samples: int = 500000  # Increased for maximum memory usage
+    ddpm_num_samples: int = 10000  # Pretraining samples (was 500000; reduced for faster smoke tests)
     
     # Coupling training
     coupling_epochs: int = 14
@@ -4028,6 +4028,8 @@ def main():
                        help="Number of epochs for coupling training (match config default)")
     parser.add_argument("--ddpm-epochs", type=int, default=3000,
                        help="Number of epochs for DDPM pretraining")
+    parser.add_argument("--ddpm-num-samples", type=int, default=10000,
+                       help="Number of synthetic samples used to pretrain each DDPM")
     parser.add_argument("--coupling-batch-size", type=int, default=2048,
                        help="Batch size for coupling training")
     parser.add_argument("--ppo-updates-per-epoch", type=int, default=20,
@@ -4107,6 +4109,7 @@ def main():
         dimensions=args.dimensions,
         coupling_epochs=args.coupling_epochs,
         ddpm_epochs=args.ddpm_epochs,
+        ddpm_num_samples=args.ddpm_num_samples,
         coupling_batch_size=args.coupling_batch_size,
         ppo_updates_per_epoch=args.ppo_updates_per_epoch,
         es_population_size=args.es_population_size,
