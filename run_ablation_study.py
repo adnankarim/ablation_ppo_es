@@ -2292,13 +2292,14 @@ class AblationRunner:
                     'dim': dim,
                 }
             
-            # Compute metrics
+            # Compute metrics (pass fast flag to skip expensive MI/entropy during training)
             metrics = InformationMetrics.compute_all_metrics(
                 x1_gen_np,
                 x2_gen_np,
                 x1_true_np,
                 x2_true_np,
-                dim=dim
+                dim=dim,
+                fast=fast
             )
             
             # Add dimension to metrics for scoring normalization
