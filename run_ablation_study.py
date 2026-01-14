@@ -2270,8 +2270,9 @@ class AblationRunner:
             num_eval = int(x1_true.shape[0])
         else:
             # Generate new test set with appropriate size for dimension
+            # CRITICAL: Match frozen eval set variance (x1 std=sqrt(0.99), x2 std=1.0)
             num_eval = 5000 if dim >= 20 else 1000
-            x1_true = torch.randn(num_eval, dim, device=self.config.device) * 1.0 + 2.0
+            x1_true = torch.randn(num_eval, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
             x2_true = x1_true + 8.0 + 0.1 * torch.randn_like(x1_true)  # Add noise for finite MI
         
         try:
