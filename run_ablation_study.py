@@ -1460,6 +1460,11 @@ class DDMECPPOTrainer:
         for p in self.anchor.model.parameters():
             p.requires_grad = False
 
+        # CRITICAL: Force-enable gradients for actor model (may be frozen from pretrained model)
+        self.actor.model.train()
+        for p in self.actor.model.parameters():
+            p.requires_grad = True
+
         self.opt = torch.optim.Adam(self.actor.model.parameters(), lr=lr)
         self.reward_ema = 0.0
         self.reward_ema_beta = 0.95
@@ -2692,6 +2697,15 @@ class AblationRunner:
             print(f"  [FINAL CHECK]")
             print(f"  X2 mean/std: {x2_final_mean:.4f}, {x2_final_std:.4f} (target: 10.0, 1.0)")
         
+        # CRITICAL: Freeze pretrained models before returning (they will be used as anchors)
+        # This ensures they're in eval mode and gradients are disabled
+        ddpm_x1.model.eval()
+        for p in ddpm_x1.model.parameters():
+            p.requires_grad = False
+        ddpm_x2.model.eval()
+        for p in ddpm_x2.model.parameters():
+            p.requires_grad = False
+        
         return ddpm_x1, ddpm_x2
     
     def _run_es_experiment(
@@ -2746,6 +2760,10 @@ class AblationRunner:
         # ES now uses same contrastive reward as PPO, so needs non-zero conditioning weights
         self.smart_load_weights(cond_x1, ddpm_x1, dim, random_cond_init=True, cond_scale=1e-3)
         print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1 (random cond weights for ES-Reward)")
+        # Force-enable gradients for ES model (pretrained model may have gradients disabled)
+        for param in cond_x1.model.parameters():
+            param.requires_grad = True
+        cond_x1.model.train()
         
         cond_x2 = MultiDimDDPM(
             dim=dim,
@@ -2759,6 +2777,10 @@ class AblationRunner:
         # Apply smart loading with RANDOM init for ES (same as PPO)
         self.smart_load_weights(cond_x2, ddpm_x2, dim, random_cond_init=True, cond_scale=1e-3)
         print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2 (random cond weights for ES-Reward)")
+        # Force-enable gradients for ES model (pretrained model may have gradients disabled)
+        for param in cond_x2.model.parameters():
+            param.requires_grad = True
+        cond_x2.model.train()
         
         # Generate training data - UNPAIRED (same as PPO for fair comparison)
         # ES now uses same unpaired objective as PPO: J(θ) = E[reward] - λ*KL
@@ -2986,6 +3008,10 @@ class AblationRunner:
         # CRITICAL: Zero init makes scorer ignore condition → no reward signal → PPO can't learn
         self.smart_load_weights(cond_x1, ddpm_x1, dim, random_cond_init=True, cond_scale=1e-3)
         print(f"    [INIT] Initialized cond_x1 from pretrained DDPM X1 (random cond weights for PPO)")
+        # Force-enable gradients for PPO model (pretrained model may have gradients disabled)
+        for param in cond_x1.model.parameters():
+            param.requires_grad = True
+        cond_x1.model.train()
         
         cond_x2 = MultiDimDDPM(
             dim=dim,
@@ -2999,6 +3025,10 @@ class AblationRunner:
         # Apply smart loading with RANDOM conditioning init for PPO bootstrapping
         self.smart_load_weights(cond_x2, ddpm_x2, dim, random_cond_init=True, cond_scale=1e-3)
         print(f"    [INIT] Initialized cond_x2 from pretrained DDPM X2 (random cond weights for PPO)")
+        # Force-enable gradients for PPO model (pretrained model may have gradients disabled)
+        for param in cond_x2.model.parameters():
+            param.requires_grad = True
+        cond_x2.model.train()
         
         # Create REAL PPO trainers with specular scoring
         # actor=cond_x1, scorer=cond_x2 (fixed during phase A)
@@ -3106,7 +3136,7 @@ class AblationRunner:
             epoch_metrics.append(metrics)
             
             # Generate checkpoint plot every epoch for better observability
-            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
+                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
             
             # Log to wandb (include all key metrics)
             if self.config.use_wandb and WANDB_AVAILABLE:
