@@ -3589,6 +3589,12 @@ def main():
                        help="Number of epochs for coupling training (match config default)")
     parser.add_argument("--ddpm-epochs", type=int, default=200,
                        help="Number of epochs for DDPM pretraining")
+    parser.add_argument("--coupling-batch-size", type=int, default=128,
+                       help="Batch size for coupling training")
+    parser.add_argument("--ppo-updates-per-epoch", type=int, default=20,
+                       help="Number of PPO updates per epoch")
+    parser.add_argument("--es-population-size", type=int, default=15,
+                       help="Population size for Evolution Strategies")
     
     # ES ablation ranges (match AblationConfig defaults)
     parser.add_argument("--es-sigma-values", type=float, nargs='+', 
@@ -3662,6 +3668,9 @@ def main():
         dimensions=args.dimensions,
         coupling_epochs=args.coupling_epochs,
         ddpm_epochs=args.ddpm_epochs,
+        coupling_batch_size=args.coupling_batch_size,
+        ppo_updates_per_epoch=args.ppo_updates_per_epoch,
+        es_population_size=args.es_population_size,
         es_sigma_values=args.es_sigma_values,
         es_lr_values=args.es_lr_values,
         ppo_kl_weight_values=args.ppo_kl_values,
