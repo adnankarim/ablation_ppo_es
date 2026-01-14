@@ -2856,18 +2856,28 @@ class AblationRunner:
             if (epoch + 1) % self.config.plot_every == 0 or (epoch + 1) == self.config.coupling_epochs:
                 self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'ES', dim, f'σ={sigma}, lr={lr}')
             
-            # Log to wandb
+            # Log to wandb (include all key metrics)
             if self.config.use_wandb and WANDB_AVAILABLE:
                 wandb.log({
                     f'ES/{dim}D/config_{config_idx}/epoch': epoch,
                     f'ES/{dim}D/config_{config_idx}/loss': metrics['loss'],
                     f'ES/{dim}D/config_{config_idx}/kl_total': metrics['kl_div_total'],
+                    f'ES/{dim}D/config_{config_idx}/mutual_information': metrics.get('mutual_information', 0.0),
                     f'ES/{dim}D/config_{config_idx}/correlation': metrics['correlation'],
-                    f'ES/{dim}D/config_{config_idx}/mae': metrics['mae'],
+                    f'ES/{dim}D/config_{config_idx}/mae': metrics.get('mae', 0.0),
+                    f'ES/{dim}D/config_{config_idx}/entropy_x1': metrics.get('entropy_x1', 0.0),
+                    f'ES/{dim}D/config_{config_idx}/entropy_x2': metrics.get('entropy_x2', 0.0),
+                    f'ES/{dim}D/config_{config_idx}/joint_entropy': metrics.get('joint_entropy', 0.0),
                 })
             
-            # Print every epoch for better observability
-            print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
+            # Print every epoch for better observability (include all key metrics)
+            mi = metrics.get('mutual_information', 0.0)
+            mae = metrics.get('mae', 0.0)
+            entropy_x1 = metrics.get('entropy_x1', 0.0)
+            entropy_x2 = metrics.get('entropy_x2', 0.0)
+            print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, "
+                  f"MI={mi:.4f}, Corr={metrics['correlation']:.4f}, MAE={mae:.4f}, "
+                  f"H(X1)={entropy_x1:.4f}, H(X2)={entropy_x2:.4f}")
             
             # Early stopping if ES diverges (100 per dim is very high)
             if metrics['kl_div_total'] > 100 or not np.isfinite(metrics['kl_div_total']):
@@ -3060,18 +3070,28 @@ class AblationRunner:
             if (epoch + 1) % self.config.plot_every == 0 or (epoch + 1) == self.config.coupling_epochs:
                 self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
             
-            # Log to wandb
+            # Log to wandb (include all key metrics)
             if self.config.use_wandb and WANDB_AVAILABLE:
                 wandb.log({
                     f'PPO/{dim}D/config_{config_idx}/epoch': epoch,
                     f'PPO/{dim}D/config_{config_idx}/loss': metrics['loss'],
                     f'PPO/{dim}D/config_{config_idx}/kl_total': metrics['kl_div_total'],
+                    f'PPO/{dim}D/config_{config_idx}/mutual_information': metrics.get('mutual_information', 0.0),
                     f'PPO/{dim}D/config_{config_idx}/correlation': metrics['correlation'],
-                    f'PPO/{dim}D/config_{config_idx}/mae': metrics['mae'],
+                    f'PPO/{dim}D/config_{config_idx}/mae': metrics.get('mae', 0.0),
+                    f'PPO/{dim}D/config_{config_idx}/entropy_x1': metrics.get('entropy_x1', 0.0),
+                    f'PPO/{dim}D/config_{config_idx}/entropy_x2': metrics.get('entropy_x2', 0.0),
+                    f'PPO/{dim}D/config_{config_idx}/joint_entropy': metrics.get('joint_entropy', 0.0),
                 })
             
-            # Print every epoch for better observability
-            print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, Corr={metrics['correlation']:.4f}")
+            # Print every epoch for better observability (include all key metrics)
+            mi = metrics.get('mutual_information', 0.0)
+            mae = metrics.get('mae', 0.0)
+            entropy_x1 = metrics.get('entropy_x1', 0.0)
+            entropy_x2 = metrics.get('entropy_x2', 0.0)
+            print(f"    Epoch {epoch+1}: Loss={metrics['loss']:.4f}, KL(sum_per_dim)={metrics['kl_div_total']:.4f}, "
+                  f"MI={mi:.4f}, Corr={metrics['correlation']:.4f}, MAE={mae:.4f}, "
+                  f"H(X1)={entropy_x1:.4f}, H(X2)={entropy_x2:.4f}")
         
         # Final evaluation
         final_metrics = epoch_metrics[-1]
