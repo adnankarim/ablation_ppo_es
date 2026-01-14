@@ -280,23 +280,19 @@ class InformationMetrics:
         else:
             h_x1 = InformationMetrics.entropy_multidim_gaussian(np.diag(std1_learned ** 2))
             h_x2 = InformationMetrics.entropy_multidim_gaussian(np.diag(std2_learned ** 2))
+            
             # True marginal entropies (for MI computation)
-            h_x1_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * (np.sqrt(0.99) ** 2)))  # x1 std = sqrt(0.99)
-            h_x2_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * 1.0))  # x2 std = 1.0
-        
-        # Joint entropies for conditional quality (true -> generated)
-        h_joint_21 = InformationMetrics.joint_entropy_from_samples(x2_true, x1_gen)
-        h_joint_12 = InformationMetrics.joint_entropy_from_samples(x1_true, x2_gen)
-        h_joint = (h_joint_21 + h_joint_12) / 2
-        
-        # Directional MI - measures conditional generation quality
-        # I(X;Y) = H(X) + H(Y) - H(X,Y)
-        # I(X2_true; X1_gen) measures how much X2_true tells us about X1_gen
-        h_x1_true = InformationMetrics.entropy_multidim_gaussian(np.eye(dim) * (target_std ** 2))
-        h_x2_true = InformationMetrics.entropy_multidim_gaussian(np.eye(dim) * (target_std ** 2))
-        
-        # Independent joint entropy (theoretical bound if X and Y were independent)
-        h_independent_joint = h_x1_true + h_x2_true
+            # CRITICAL: x1 std = sqrt(0.99), x2 std = 1.0 (matches eval distribution)
+            h_x1_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * (np.sqrt(0.99) ** 2)))
+            h_x2_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * 1.0))
+            
+            # Joint entropies for conditional quality (true -> generated)
+            h_joint_21 = InformationMetrics.joint_entropy_from_samples(x2_true, x1_gen)
+            h_joint_12 = InformationMetrics.joint_entropy_from_samples(x1_true, x2_gen)
+            h_joint = (h_joint_21 + h_joint_12) / 2
+            
+            # Independent joint entropy (theoretical bound if X and Y were independent)
+            h_independent_joint = h_x1_true + h_x2_true
         
         mi_21 = max(0, h_x2_true + h_x1 - h_joint_21)  # I(X2_true; X1_gen)
         mi_12 = max(0, h_x1_true + h_x2 - h_joint_12)  # I(X1_true; X2_gen)
@@ -2185,12 +2181,19 @@ class AblationRunner:
                 # Use different seed for phase B (but deterministic)
                 log_b = ppo_x2.train_step(y_cond=x1_batch, seed=seed + 1000000)
                 
-                epoch_logs.append(0.5 * (log_a["reward_mean"] + log_b["reward_mean"]))
+                epoch_logs.append({
+                    'ppo_obj': 0.5 * (log_a.get('ppo_obj', 0.0) + log_b.get('ppo_obj', 0.0)),
+                    'reward_mean': 0.5 * (log_a.get('reward_mean', 0.0) + log_b.get('reward_mean', 0.0)),
+                    'anchor_kl': 0.5 * (log_a.get('anchor_kl', 0.0) + log_b.get('anchor_kl', 0.0)),
+                })
             
             # Evaluate coupling quality after both phases
-            metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true)
+            # Use fast mode during training (skip expensive MI/entropy), full eval at checkpoints
+            fast_eval = ((epoch + 1) % self.config.plot_every != 0) and ((epoch + 1) != self.config.coupling_epochs)
+            metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true, fast=fast_eval)
             metrics['epoch'] = epoch + 1  # Epochs: 1, 2, 3... (epoch 0 is initial)
-            metrics['loss'] = float(-np.mean(epoch_logs))  # Higher reward => lower "loss" for plotting
+            # Use PPO objective for loss (consistent with actor objective)
+            metrics['loss'] = float(-np.mean([log.get('ppo_obj', 0.0) for log in epoch_logs])) if epoch_logs else 0.0
             metrics['kl_weight'] = kl_weight
             metrics['ppo_clip'] = ppo_clip
             metrics['lr'] = lr
