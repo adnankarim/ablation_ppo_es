@@ -81,8 +81,91 @@ except ImportError:
 class InformationMetrics:
     """
     Robust Information-Theoretic Metrics Calculator.
-    Fixes NaNs by using eigenvalue decomposition and consistent sample-based estimators.
+    Uses histogram-based entropy with dynamic binning to handle out-of-bounds samples.
+    Falls back to Gaussian-based entropy for high-dimensional data.
     """
+    
+    @staticmethod
+    def entropy_histogram(data: np.ndarray, bins: int = 100) -> float:
+        """
+        Robust Entropy calculation using histogram with dynamic binning.
+        Never returns NaN - adapts to actual data range.
+        """
+        # Flatten for 1D histogram (works per-dimension for multi-dim)
+        data_flat = data.flatten()
+        
+        # 1. Clean data: Remove Infs/NaNs
+        data_flat = data_flat[np.isfinite(data_flat)]
+        
+        # 2. Handle empty or constant data (Entropy = 0)
+        if len(data_flat) < 2 or np.all(data_flat == data_flat[0]):
+            return 0.0
+        
+        # 3. Dynamic Range: Use actual min/max instead of fixed range
+        # Add a tiny buffer so the min/max values fall inside the bins
+        range_min, range_max = data_flat.min() - 1e-5, data_flat.max() + 1e-5
+        
+        # 4. Compute Density Histogram
+        counts, _ = np.histogram(data_flat, bins=bins, range=(range_min, range_max), density=False)
+        
+        # 5. Normalize to get Probabilities
+        total = counts.sum()
+        if total == 0:
+            return 0.0
+        probs = counts / total
+        
+        # 6. Calculate Entropy: -Sum(p * log(p))
+        # Filter out zero probabilities to avoid log(0) error
+        valid_probs = probs[probs > 0]
+        if len(valid_probs) == 0:
+            return 0.0
+        
+        entropy = -np.sum(valid_probs * np.log(valid_probs + 1e-10))  # Add small epsilon for numerical stability
+        return float(entropy)
+    
+    @staticmethod
+    def mutual_information_histogram(x: np.ndarray, y: np.ndarray, bins: int = 100) -> float:
+        """
+        Robust MI calculation using 2D histogram: MI(X;Y) = H(X) + H(Y) - H(X,Y)
+        """
+        # Flatten for 1D histogram (for multi-dim, compute per dimension and average)
+        x_flat = x.flatten()
+        y_flat = y.flatten()
+        
+        # 1. Clean and Align Data
+        mask = np.isfinite(x_flat) & np.isfinite(y_flat)
+        x_clean = x_flat[mask]
+        y_clean = y_flat[mask]
+        
+        if len(x_clean) < 2:
+            return 0.0
+        
+        # 2. Calculate Individual Entropies
+        h_x = InformationMetrics.entropy_histogram(x_clean, bins)
+        h_y = InformationMetrics.entropy_histogram(y_clean, bins)
+        
+        # 3. Calculate Joint Entropy H(X, Y) using 2D Histogram
+        # Use dynamic range for both dimensions
+        x_min, x_max = x_clean.min() - 1e-5, x_clean.max() + 1e-5
+        y_min, y_max = y_clean.min() - 1e-5, y_clean.max() + 1e-5
+        
+        H, _, _ = np.histogram2d(x_clean, y_clean, bins=bins, range=[[x_min, x_max], [y_min, y_max]])
+        
+        # Normalize to probabilities
+        total = H.sum()
+        if total == 0:
+            return 0.0
+        probs_xy = H / total
+        valid_probs_xy = probs_xy[probs_xy > 0]
+        
+        if len(valid_probs_xy) == 0:
+            return 0.0
+        
+        h_xy = -np.sum(valid_probs_xy * np.log(valid_probs_xy + 1e-10))
+        
+        # 4. MI = H(X) + H(Y) - H(X, Y)
+        mi = max(0.0, h_x + h_y - h_xy)  # Clamp to 0 to avoid negative noise
+        return float(mi)
     
     @staticmethod
     def entropy_from_cov(cov_matrix: np.ndarray) -> float:
@@ -113,17 +196,41 @@ class InformationMetrics:
             return float(0.5 * np.sum(np.log(2 * np.pi * np.e * np.diag(reg_cov))))
     
     @staticmethod
-    def compute_entropy_samples(data: np.ndarray) -> float:
-        """Estimate entropy of data samples assuming multivariate Gaussian."""
+    def compute_entropy_samples(data: np.ndarray, use_histogram: bool = True) -> float:
+        """
+        Estimate entropy of data samples.
+        Uses histogram-based method (robust to outliers) by default.
+        Falls back to Gaussian-based method for high-dimensional data.
+        """
         # Ensure (N, dim)
         if data.ndim == 1:
             data = data.reshape(-1, 1)
+        
         # Check for NaN/Inf
         if not np.all(np.isfinite(data)):
             return float('nan')
-        # If variance is 0 (model collapse), entropy is -inf. Return a safe low number.
+        
+        # If variance is 0 (model collapse), entropy is 0
         if np.var(data) < 1e-9:
-            return -10.0
+            return 0.0
+        
+        # Use histogram method for low dimensions (more robust to outliers)
+        # Use Gaussian method for high dimensions (more efficient)
+        if use_histogram and data.shape[1] <= 10:
+            try:
+                # For multi-dim, compute per-dimension and sum (approximation)
+                if data.shape[1] == 1:
+                    return InformationMetrics.entropy_histogram(data, bins=100)
+                else:
+                    # Sum of marginal entropies (upper bound on joint entropy)
+                    h_sum = sum(InformationMetrics.entropy_histogram(data[:, d], bins=100) 
+                               for d in range(data.shape[1]))
+                    return h_sum
+            except Exception:
+                # Fall back to Gaussian if histogram fails
+                pass
+        
+        # Gaussian-based entropy (fallback or for high-dim)
         try:
             cov = np.cov(data, rowvar=False)
             return InformationMetrics.entropy_from_cov(cov)
@@ -210,27 +317,49 @@ class InformationMetrics:
         results['mae'] = float(0.5 * (mae_21 + mae_12))
         
         if not fast:
+            # Use histogram-based entropy for robustness to outliers
             # H(X_gen)
-            h_x1_gen = InformationMetrics.compute_entropy_samples(x1_gen)
-            h_x2_gen = InformationMetrics.compute_entropy_samples(x2_gen)
+            h_x1_gen = InformationMetrics.compute_entropy_samples(x1_gen, use_histogram=True)
+            h_x2_gen = InformationMetrics.compute_entropy_samples(x2_gen, use_histogram=True)
             
             # H(X_true) - needed for cross-MI
-            h_x1_true = InformationMetrics.compute_entropy_samples(x1_true)
-            h_x2_true = InformationMetrics.compute_entropy_samples(x2_true)
+            h_x1_true = InformationMetrics.compute_entropy_samples(x1_true, use_histogram=True)
+            h_x2_true = InformationMetrics.compute_entropy_samples(x2_true, use_histogram=True)
             
-            # Joint H(X1_gen, X2_true) -> estimating I(X1_gen; X2_true)
-            # Stack samples: shape (N, 2*dim)
-            joint_21 = np.hstack([x1_gen, x2_true])
-            h_joint_21 = InformationMetrics.compute_entropy_samples(joint_21)
-            
-            # Joint H(X2_gen, X1_true) -> estimating I(X2_gen; X1_true)
-            joint_12 = np.hstack([x2_gen, x1_true])
-            h_joint_12 = InformationMetrics.compute_entropy_samples(joint_12)
-            
-            # MI = H(X) + H(Y) - H(X,Y)
-            # Calculated PURELY from samples to cancel out biases in H estimators
-            mi_21 = max(0.0, h_x1_gen + h_x2_true - h_joint_21)
-            mi_12 = max(0.0, h_x2_gen + h_x1_true - h_joint_12)
+            # For MI: Use histogram-based method for 1D, per-dimension for multi-dim
+            if dim == 1:
+                # Direct histogram-based MI (most robust)
+                mi_21 = InformationMetrics.mutual_information_histogram(x1_gen[:, 0], x2_true[:, 0], bins=100)
+                mi_12 = InformationMetrics.mutual_information_histogram(x2_gen[:, 0], x1_true[:, 0], bins=100)
+                
+                # Joint entropy from histogram (for conditional entropy)
+                joint_21 = np.hstack([x1_gen, x2_true])
+                h_joint_21 = InformationMetrics.compute_entropy_samples(joint_21, use_histogram=True)
+                joint_12 = np.hstack([x2_gen, x1_true])
+                h_joint_12 = InformationMetrics.compute_entropy_samples(joint_12, use_histogram=True)
+            else:
+                # Multi-dim: compute MI per dimension and average
+                mi_21_dims = []
+                mi_12_dims = []
+                h_joint_21_dims = []
+                h_joint_12_dims = []
+                
+                for d in range(dim):
+                    mi_21_d = InformationMetrics.mutual_information_histogram(
+                        x1_gen[:, d], x2_true[:, d], bins=100)
+                    mi_12_d = InformationMetrics.mutual_information_histogram(
+                        x2_gen[:, d], x1_true[:, d], bins=100)
+                    mi_21_dims.append(mi_21_d)
+                    mi_12_dims.append(mi_12_d)
+                
+                mi_21 = np.mean(mi_21_dims) if mi_21_dims else 0.0
+                mi_12 = np.mean(mi_12_dims) if mi_12_dims else 0.0
+                
+                # Joint entropy (Gaussian-based for multi-dim)
+                joint_21 = np.hstack([x1_gen, x2_true])
+                h_joint_21 = InformationMetrics.compute_entropy_samples(joint_21, use_histogram=False)
+                joint_12 = np.hstack([x2_gen, x1_true])
+                h_joint_12 = InformationMetrics.compute_entropy_samples(joint_12, use_histogram=False)
             
             results['entropy_x1'] = h_x1_gen
             results['entropy_x2'] = h_x2_gen
@@ -241,8 +370,8 @@ class InformationMetrics:
             results['mi_x1_to_x2'] = mi_12
             
             # Conditional H(X|Y) = H(X,Y) - H(Y)
-            results['h_x1_given_x2'] = max(0.0, h_joint_21 - h_x2_true)
-            results['h_x2_given_x1'] = max(0.0, h_joint_12 - h_x1_true)
+            results['h_x1_given_x2'] = max(0.0, h_joint_21 - h_x2_true) if np.isfinite(h_joint_21) and np.isfinite(h_x2_true) else np.nan
+            results['h_x2_given_x1'] = max(0.0, h_joint_12 - h_x1_true) if np.isfinite(h_joint_12) and np.isfinite(h_x1_true) else np.nan
         
         # Standard outputs
         results.update({
