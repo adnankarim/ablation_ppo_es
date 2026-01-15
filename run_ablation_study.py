@@ -292,7 +292,7 @@ class AblationConfig:
     ddpm_num_samples: int = 10000  # Pretraining samples (was 500000; reduced for faster smoke tests)
     
     # Coupling training
-    coupling_epochs: int = 14
+    coupling_epochs: int = 100
     coupling_batch_size: int = 2048  # Increased for maximum memory usage
     coupling_num_samples: int = 300000  # Increased for maximum memory usage
     warmup_epochs: int = 15  # Increased for stability in high dimensions
@@ -4330,7 +4330,7 @@ def main():
                        help="Dimensions to test")
     
     # Training parameters
-    parser.add_argument("--coupling-epochs", type=int, default=20,
+    parser.add_argument("--coupling-epochs", type=int, default=100,
                        help="Number of epochs for coupling training (match config default)")
     parser.add_argument("--ddpm-epochs", type=int, default=100,
                        help="Number of epochs for DDPM pretraining")
