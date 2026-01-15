@@ -181,14 +181,19 @@ class InformationMetrics:
         kl_2 = np.asarray(gaussian_kl(mu2_learned, std2_learned, np.full(dim, target_mu2), np.full(dim, target_std2)) / dim).item()
         
         # --- 4. Information Metrics (Entropy & MI) ---
-        # Initialize with NaNs or zeros
+        # Initialize with NaNs or zeros. Always create all keys so downstream
+        # logging/plotting code can safely access them even in fast mode.
         results = {
             'entropy_x1': np.nan,
             'entropy_x2': np.nan,
             'joint_entropy': np.nan,
             'mutual_information': 0.0,
+            'mi_x2_to_x1': 0.0,
+            'mi_x1_to_x2': 0.0,
+            'h_x1_given_x2': np.nan,
+            'h_x2_given_x1': np.nan,
             'correlation': 0.0,
-            'mae': 0.0
+            'mae': 0.0,
         }
         
         # Correlation (Robust)
