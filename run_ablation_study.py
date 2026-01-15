@@ -79,133 +79,56 @@ except ImportError:
 # ============================================================================
 
 class InformationMetrics:
-    """Compute information-theoretic metrics for coupling evaluation."""
+    """
+    Robust Information-Theoretic Metrics Calculator.
+    Fixes NaNs by using eigenvalue decomposition and consistent sample-based estimators.
+    """
     
     @staticmethod
-    def entropy_gaussian(std: float) -> float:
-        """Entropy of 1D Gaussian: H(X) = 0.5 * ln(2πeσ²)"""
-        return 0.5 * np.log(2 * np.pi * np.e * (std ** 2 + 1e-8))
-    
-    @staticmethod
-    def entropy_multidim_gaussian(cov_matrix: np.ndarray) -> float:
-        """Entropy of multivariate Gaussian: H(X) = 0.5 * ln((2πe)^d * det(Σ))
-        
-        Returns total entropy (not normalized per dimension).
+    def entropy_from_cov(cov_matrix: np.ndarray) -> float:
+        """
+        Compute Gaussian entropy from covariance matrix using Eigenvalues.
+        Robust to singular matrices.
+        H(X) = 0.5 * (d * log(2πe) + log|Σ|)
         """
         cov_matrix = np.atleast_2d(cov_matrix)
         d = cov_matrix.shape[0]
-        
-        # Add regularization for numerical stability
-        reg_strength = max(1e-4, 1e-3 * np.sqrt(d))  # Scale with sqrt(dim)
-        reg_cov = cov_matrix + np.eye(d) * reg_strength
-        
-        # Clamp diagonal to reasonable range
-        diag_vals = np.diag(reg_cov).copy()
-        diag_vals = np.clip(diag_vals, 0.01, 10000)  # Reasonable variance range
-        np.fill_diagonal(reg_cov, diag_vals)
-        
+        # 1. Stronger Regularization (Jitter)
+        # Scale jitter by the mean diagonal element to handle different data scales
+        diag_mean = np.mean(np.diag(cov_matrix))
+        epsilon = 1e-5 * max(1.0, diag_mean)
+        reg_cov = cov_matrix + np.eye(d) * epsilon
         try:
-            # For high dimensions, use log-det to avoid overflow
-            sign, logdet = np.linalg.slogdet(reg_cov)
-            
-            if sign <= 0 or not np.isfinite(logdet):
-                # Fallback: use product of diagonal (assumes independence)
-                logdet = np.sum(np.log(diag_vals))
-            
-            # H(X) = 0.5 * (d * log(2πe) + log(det(Σ)))
+            # 2. Use Eigenvalues (eigh) instead of slogdet
+            # det(A) = prod(eigenvalues) => log(det(A)) = sum(log(eigenvalues))
+            # eigh is for symmetric matrices (covariance is always symmetric)
+            eigenvalues, _ = np.linalg.eigh(reg_cov)
+            # Clip eigenvalues to be positive (numerical noise can make them slightly negative)
+            eigenvalues = np.maximum(eigenvalues, 1e-9)
+            logdet = np.sum(np.log(eigenvalues))
             entropy = 0.5 * (d * np.log(2 * np.pi * np.e) + logdet)
-            
-        except Exception as e:
-            # If anything fails, use diagonal approximation
-            logdet = np.sum(np.log(diag_vals))
-            entropy = 0.5 * (d * np.log(2 * np.pi * np.e) + logdet)
-        
-        # Clamp to reasonable range per dimension
-        # For unit variance Gaussian: H ≈ 0.5*log(2πe) ≈ 1.42 per dimension
-        max_entropy_per_dim = 6.0  # Allow variance up to ~exp(10) ≈ 22000
-        min_entropy_per_dim = -2.0  # Allow variance down to ~exp(-6) ≈ 0.002
-        
-        max_entropy = d * max_entropy_per_dim
-        min_entropy = d * min_entropy_per_dim
-        
-        return np.clip(entropy, min_entropy, max_entropy)
+            return float(entropy)
+        except Exception:
+            # Fallback: Diagonal approximation (assume independence) if Estimator fails
+            return float(0.5 * np.sum(np.log(2 * np.pi * np.e * np.diag(reg_cov))))
     
     @staticmethod
-    def kl_divergence_gaussian(mu_p: np.ndarray, std_p: np.ndarray, 
-                                mu_q: np.ndarray, std_q: np.ndarray,
-                                per_dimension: bool = True) -> float:
-        """KL divergence between two Gaussians: KL(p||q)
-        
-        Args:
-            per_dimension: If True, returns average KL per dimension for fair comparison
-        """
-        d = len(mu_p) if hasattr(mu_p, '__len__') else 1
-        mu_p = np.atleast_1d(mu_p).astype(float)
-        mu_q = np.atleast_1d(mu_q).astype(float)
-        
-        # Clamp std to reasonable range to avoid numerical issues
-        std_p = np.atleast_1d(std_p).astype(float)
-        std_q = np.atleast_1d(std_q).astype(float)
-        std_p = np.clip(std_p, 0.01, 100.0)  # Clamp between 0.01 and 100
-        std_q = np.clip(std_q, 0.01, 100.0)
-        
-        # Clamp means to reasonable range
-        mu_p = np.clip(mu_p, -1000, 1000)
-        mu_q = np.clip(mu_q, -1000, 1000)
-        
-        var_p = std_p ** 2
-        var_q = std_q ** 2
-        
-        # KL formula with numerical stability
-        mean_diff_sq = np.minimum((mu_p - mu_q) ** 2, 10000)  # Cap squared diff
-        var_ratio = np.clip(var_p / var_q, 1e-6, 1e6)  # Cap variance ratio
-        log_var_ratio = np.clip(np.log(var_q / var_p), -20, 20)  # Cap log ratio
-        
-        kl_per_dim = 0.5 * (mean_diff_sq / var_q + var_ratio - 1 + log_var_ratio)
-        kl_total = np.sum(kl_per_dim)
-        
-        if per_dimension:
-            return max(0.0, float(kl_total / d))  # Average per dimension
-        else:
-            return max(0.0, float(kl_total))
-    
-    @staticmethod
-    def joint_entropy_from_samples(x: np.ndarray, y: np.ndarray) -> float:
-        """Estimate joint entropy H(X,Y) from samples using Gaussian assumption."""
-        xy = np.column_stack([x.reshape(-1, x.shape[-1]) if x.ndim > 1 else x.reshape(-1, 1),
-                              y.reshape(-1, y.shape[-1]) if y.ndim > 1 else y.reshape(-1, 1)])
-        
-        d = xy.shape[1]
-        
-        # Clean the data first
-        valid_mask = np.all(np.isfinite(xy), axis=1)
-        if np.sum(valid_mask) < max(10, d * 2):  # Need enough samples
-            return d * InformationMetrics.entropy_gaussian(1.0)
-        xy = xy[valid_mask]
-        
-        # Clamp extreme values
-        xy = np.clip(xy, -100, 100)
-        
-        # Compute covariance with regularization
+    def compute_entropy_samples(data: np.ndarray) -> float:
+        """Estimate entropy of data samples assuming multivariate Gaussian."""
+        # Ensure (N, dim)
+        if data.ndim == 1:
+            data = data.reshape(-1, 1)
+        # Check for NaN/Inf
+        if not np.all(np.isfinite(data)):
+            return float('nan')
+        # If variance is 0 (model collapse), entropy is -inf. Return a safe low number.
+        if np.var(data) < 1e-9:
+            return -10.0
         try:
-            cov = np.cov(xy.T)
-            
-            # Ensure cov is 2D
-            if cov.ndim == 0:
-                cov = np.array([[cov]])
-            
-            # Check for NaN or Inf in covariance
-            if not np.all(np.isfinite(cov)):
-                return d * InformationMetrics.entropy_gaussian(1.0)
-            
-            # Add stronger ridge regularization for high dimensions
-            reg_strength = max(1e-4, 1e-3 * np.sqrt(d))  # Stronger regularization
-            cov = cov + np.eye(d) * reg_strength
-            
-            return InformationMetrics.entropy_multidim_gaussian(cov)
-        except Exception as e:
-            # Fallback: assume independence
-            return d * InformationMetrics.entropy_gaussian(1.0)
+            cov = np.cov(data, rowvar=False)
+            return InformationMetrics.entropy_from_cov(cov)
+        except Exception:
+            return float('nan')
     
     @staticmethod
     def compute_all_metrics(
@@ -216,228 +139,131 @@ class InformationMetrics:
         target_mu1: float = 2.0,
         target_mu2: float = 10.0,
         target_std: float = 1.0,
-        target_std1: float = None,  # If None, use target_std for X1
-        target_std2: float = None,  # If None, use target_std for X2
+        target_std1: float = None,
+        target_std2: float = None,
         dim: int = 1,
         fast: bool = False,
     ) -> Dict[str, float]:
-        """Compute all information-theoretic metrics."""
+        """
+        Compute robust metrics.
+        Uses pure sample-based estimation for MI to avoid 'theoretical vs sample' bias.
+        """
+        # --- 1. Data Cleaning ---
+        def clean(x, default_mu):
+            # Replace NaNs
+            x = np.nan_to_num(x, nan=default_mu, posinf=default_mu+50, neginf=default_mu-50)
+            # Clip to prevent extreme outliers from exploding covariance
+            return np.clip(x, default_mu - 100, default_mu + 100)
         
-        # Ensure proper shape
-        if x1_gen.ndim == 1:
-            x1_gen = x1_gen.reshape(-1, 1)
-            x2_gen = x2_gen.reshape(-1, 1)
-            x1_true = x1_true.reshape(-1, 1)
-            x2_true = x2_true.reshape(-1, 1)
+        x1_gen = clean(x1_gen.reshape(-1, dim), target_mu1)
+        x2_gen = clean(x2_gen.reshape(-1, dim), target_mu2)
+        x1_true = clean(x1_true.reshape(-1, dim), target_mu1)
+        x2_true = clean(x2_true.reshape(-1, dim), target_mu2)
         
-        # CRITICAL: Clean generated samples - remove NaN/Inf and clamp to reasonable range
-        def clean_samples(x: np.ndarray, expected_mean: float) -> np.ndarray:
-            """Clean samples by handling NaN/Inf and clamping extremes."""
-            x = x.copy()
-            # Replace NaN/Inf with expected mean
-            nan_mask = ~np.isfinite(x)
-            if np.any(nan_mask):
-                x[nan_mask] = expected_mean
-            # Clamp to reasonable range (within 50 std of expected mean)
-            x = np.clip(x, expected_mean - 50, expected_mean + 50)
-            return x
+        # --- 2. Learned Statistics ---
+        mu1_learned = np.mean(x1_gen, axis=0)
+        mu2_learned = np.mean(x2_gen, axis=0)
+        std1_learned = np.std(x1_gen, axis=0)
+        std2_learned = np.std(x2_gen, axis=0)
         
-        x1_gen = clean_samples(x1_gen, target_mu1)
-        x2_gen = clean_samples(x2_gen, target_mu2)
-        
-        # Learned statistics
-        mu1_learned = np.nanmean(x1_gen, axis=0)
-        mu2_learned = np.nanmean(x2_gen, axis=0)
-        std1_learned = np.nanstd(x1_gen, axis=0) + 1e-8
-        std2_learned = np.nanstd(x2_gen, axis=0) + 1e-8
-        
-        # Ensure minimum std to avoid numerical issues with untrained models
-        std1_learned = np.maximum(std1_learned, 0.3)
-        std2_learned = np.maximum(std2_learned, 0.3)
-        
-        # Target statistics
-        # CRITICAL: Use separate target stds to match eval distribution
-        # x1_true ~ N(2, sqrt(0.99)), x2_true ~ N(10, 1.0)
+        # --- 3. KL Divergence (Marginal Quality) ---
         target_std1 = target_std1 if target_std1 is not None else target_std
         target_std2 = target_std2 if target_std2 is not None else target_std
         
-        mu1_target = np.full(dim, target_mu1)
-        mu2_target = np.full(dim, target_mu2)
-        std1_target = np.full(dim, target_std1)
-        std2_target = np.full(dim, target_std2)
+        # Use simple diagonal KL for marginals
+        def gaussian_kl(m_p, s_p, m_q, s_q):
+            # KL(P || Q)
+            v_p, v_q = s_p**2, s_q**2
+            return 0.5 * (np.sum(np.log(v_q / (v_p + 1e-9))) - dim + np.sum(v_p / (v_q + 1e-9)) + np.sum((m_p - m_q)**2) / (v_q + 1e-9))
         
-        # KL Divergences (per-dimension for fair comparison across dims)
-        # NOTE: This measures marginal distribution quality P(X) vs target
-        # For synthetic Gaussian marginals with correct coupling (X2 ≈ X1 + 8),
-        # KL should generally stay LOW or decrease as model learns coupling correctly.
-        # KL may increase if: conditional model distorts marginal variance, sampling
-        # instability dominates, or reward pushes "shortcut" solutions.
-        # Use KL as a sanity check, not an expectation of increase.
-        kl_1 = InformationMetrics.kl_divergence_gaussian(mu1_learned, std1_learned, mu1_target, std1_target, per_dimension=True)
-        kl_2 = InformationMetrics.kl_divergence_gaussian(mu2_learned, std2_learned, mu2_target, std2_target, per_dimension=True)
+        kl_1 = gaussian_kl(mu1_learned, std1_learned, np.full(dim, target_mu1), np.full(dim, target_std1)) / dim
+        kl_2 = gaussian_kl(mu2_learned, std2_learned, np.full(dim, target_mu2), np.full(dim, target_std2)) / dim
         
-        # Marginal Entropies (use learned statistics, but with minimum std guard)
-        # For multivariate Gaussian with diagonal covariance (independent dims)
-        # Fast mode: skip expensive entropy/MI computation during training
-        if fast:
-            # Use np.nan for expensive metrics (avoids fake "zero dips" in plots)
-            h_x1 = np.nan
-            h_x2 = np.nan
-            h_joint_21 = np.nan
-            h_joint_12 = np.nan
-            h_joint = np.nan
-            mutual_info = np.nan
-            mi_21 = np.nan
-            mi_12 = np.nan
-            mi_gen_gen = np.nan
-            h_x1_given_x2 = np.nan
-            h_x2_given_x1 = np.nan
-            
-            # Still define theoretical baselines cheaply (needed for return dict)
-            h_theoretical = InformationMetrics.entropy_multidim_gaussian(np.eye(dim) * (target_std ** 2))
-            h_x1_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * (np.sqrt(0.99) ** 2)))
-            h_x2_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * 1.0))
-            h_independent_joint = h_x1_true + h_x2_true
-        else:
-            # Marginal entropies from learned statistics
-            # NOTE: These can be NaN if std1_learned or std2_learned are invalid
-            # (e.g., all samples identical or extreme out-of-bounds values)
-            h_x1 = InformationMetrics.entropy_multidim_gaussian(np.diag(std1_learned ** 2))
-            h_x2 = InformationMetrics.entropy_multidim_gaussian(np.diag(std2_learned ** 2))
-            
-            # Handle NaN in marginal entropies (fallback to theoretical values)
-            if not np.isfinite(h_x1):
-                h_x1 = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * (np.sqrt(0.99) ** 2)))
-            if not np.isfinite(h_x2):
-                h_x2 = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * 1.0))
-            
-            # True marginal entropies (for MI computation)
-            # CRITICAL: x1 std = sqrt(0.99), x2 std = 1.0 (matches eval distribution)
-            h_x1_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * (np.sqrt(0.99) ** 2)))
-            h_x2_true = InformationMetrics.entropy_multidim_gaussian(np.diag(np.ones(dim) * 1.0))
-            
-            # Joint entropies for conditional quality (true -> generated)
-            # NOTE: In early ES training, random weight perturbations can generate samples
-            # far outside the expected range (e.g., -20 to +50 for 1D data). This can cause
-            # entropy/MI calculations to produce NaN. This is NOT a model failure - the model
-            # will recover as ES updates push it back into reasonable ranges. We handle this
-            # gracefully with fallback values.
-            h_joint_21 = InformationMetrics.joint_entropy_from_samples(x2_true, x1_gen)
-            h_joint_12 = InformationMetrics.joint_entropy_from_samples(x1_true, x2_gen)
-            
-            # Handle NaN from out-of-bounds samples (common in early ES epochs)
-            if not np.isfinite(h_joint_21):
-                h_joint_21 = h_x2_true + h_x1  # Fallback: assume independence
-            if not np.isfinite(h_joint_12):
-                h_joint_12 = h_x1_true + h_x2  # Fallback: assume independence
-            
-            h_joint = (h_joint_21 + h_joint_12) / 2
-            
-            # Independent joint entropy (theoretical bound if X and Y were independent)
-            h_independent_joint = h_x1_true + h_x2_true
-            
-            # Directional MI - measures conditional generation quality
-            # I(X;Y) = H(X) + H(Y) - H(X,Y)
-            # I(X2_true; X1_gen) measures how much X2_true tells us about X1_gen
-            mi_21 = max(0, h_x2_true + h_x1 - h_joint_21)  # I(X2_true; X1_gen)
-            mi_12 = max(0, h_x1_true + h_x2 - h_joint_12)  # I(X1_true; X2_gen)
-            
-            # Handle NaN in MI (can occur if entropy calculations failed)
-            if not np.isfinite(mi_21):
-                mi_21 = 0.0  # Fallback: no mutual information
-            if not np.isfinite(mi_12):
-                mi_12 = 0.0  # Fallback: no mutual information
-            
-            # NOTE: This is a hybrid "true ↔ generated" MI proxy, not standard joint MI
-            # mi_21 = I(X2_true; X1_gen), mi_12 = I(X1_true; X2_gen)
-            # This measures dependence between true and generated samples (useful for coupling quality)
-            # Symmetric MI (average of both directions) - proxy for true↔generated coupling
-            mutual_info = 0.5 * (mi_21 + mi_12)
-            
-            # Handle NaN in final MI
-            if not np.isfinite(mutual_info):
-                mutual_info = 0.0  # Fallback: no mutual information
-            
-            # Clamp MI to reasonable range (per dimension): [0, 6*dim] 
-            # For independent: MI ≈ 0, for fully dependent: MI ≈ H(X)
-            mutual_info = float(np.clip(mutual_info, 0.0, 6.0 * dim))
-            
-            # Also compute gen->gen MI for reference (optional, kept for backward compatibility)
-            h_joint_gen = InformationMetrics.joint_entropy_from_samples(x1_gen, x2_gen)
-            if not np.isfinite(h_joint_gen):
-                h_joint_gen = h_x1 + h_x2  # Fallback: assume independence
-            mi_gen_gen = max(0, h_x1 + h_x2 - h_joint_gen)
-            if not np.isfinite(mi_gen_gen):
-                mi_gen_gen = 0.0  # Fallback: no mutual information
-            mi_gen_gen = float(np.clip(mi_gen_gen, 0.0, 6.0 * dim))
-            
-            # Conditional Entropy H(X|Y) = H(X,Y) - H(Y)
-            h_x1_given_x2 = max(0, h_joint_21 - h_x2_true)
-            h_x2_given_x1 = max(0, h_joint_12 - h_x1_true)
-            # Handle NaN in conditional entropies
-            if not np.isfinite(h_x1_given_x2):
-                h_x1_given_x2 = h_x1  # Fallback: assume independence
-            if not np.isfinite(h_x2_given_x1):
-                h_x2_given_x1 = h_x2  # Fallback: assume independence
-            
-            # Theoretical bounds
-            h_theoretical = InformationMetrics.entropy_multidim_gaussian(np.eye(dim) * (target_std ** 2))
+        # --- 4. Information Metrics (Entropy & MI) ---
+        # Initialize with NaNs or zeros
+        results = {
+            'entropy_x1': np.nan,
+            'entropy_x2': np.nan,
+            'joint_entropy': np.nan,
+            'mutual_information': 0.0,
+            'correlation': 0.0,
+            'mae': 0.0
+        }
         
-        # Correlation
+        # Correlation (Robust)
         corrs = []
         for d in range(dim):
-            c1 = np.corrcoef(x2_true[:, d], x1_gen[:, d])[0, 1]
-            c2 = np.corrcoef(x1_true[:, d], x2_gen[:, d])[0, 1]
-            if np.isfinite(c1):
-                corrs.append(c1)
-            if np.isfinite(c2):
-                corrs.append(c2)
-        correlation = np.mean(corrs) if corrs else 0.0
+            # Check for zero variance before correlation
+            if std1_learned[d] > 1e-5 and np.std(x2_true[:, d]) > 1e-5:
+                corrs.append(np.corrcoef(x2_true[:, d], x1_gen[:, d])[0, 1])
+        results['correlation'] = float(np.mean(corrs)) if corrs else 0.0
         
         # MAE
-        mae_21 = np.abs(x1_gen - (x2_true - 8.0)).mean()
-        mae_12 = np.abs(x2_gen - (x1_true + 8.0)).mean()
-        mae = (mae_21 + mae_12) / 2
+        mae_21 = np.mean(np.abs(x1_gen - (x2_true - 8.0)))  # x1 = x2 - 8
+        mae_12 = np.mean(np.abs(x2_gen - (x1_true + 8.0)))  # x2 = x1 + 8
+        results['mae'] = float(0.5 * (mae_21 + mae_12))
         
-        # KL metrics: clarify naming to avoid confusion
-        kl_sum_per_dim = float(kl_1 + kl_2)  # Sum of per-dim KLs (normalized metric)
-        kl_total_over_dims = float((kl_1 + kl_2) * dim)  # Total KL over all dimensions
+        if not fast:
+            # H(X_gen)
+            h_x1_gen = InformationMetrics.compute_entropy_samples(x1_gen)
+            h_x2_gen = InformationMetrics.compute_entropy_samples(x2_gen)
+            
+            # H(X_true) - needed for cross-MI
+            h_x1_true = InformationMetrics.compute_entropy_samples(x1_true)
+            h_x2_true = InformationMetrics.compute_entropy_samples(x2_true)
+            
+            # Joint H(X1_gen, X2_true) -> estimating I(X1_gen; X2_true)
+            # Stack samples: shape (N, 2*dim)
+            joint_21 = np.hstack([x1_gen, x2_true])
+            h_joint_21 = InformationMetrics.compute_entropy_samples(joint_21)
+            
+            # Joint H(X2_gen, X1_true) -> estimating I(X2_gen; X1_true)
+            joint_12 = np.hstack([x2_gen, x1_true])
+            h_joint_12 = InformationMetrics.compute_entropy_samples(joint_12)
+            
+            # MI = H(X) + H(Y) - H(X,Y)
+            # Calculated PURELY from samples to cancel out biases in H estimators
+            mi_21 = max(0.0, h_x1_gen + h_x2_true - h_joint_21)
+            mi_12 = max(0.0, h_x2_gen + h_x1_true - h_joint_12)
+            
+            results['entropy_x1'] = h_x1_gen
+            results['entropy_x2'] = h_x2_gen
+            results['joint_entropy'] = 0.5 * (h_joint_21 + h_joint_12)
+            # Symmetric MI Proxy
+            results['mutual_information'] = 0.5 * (mi_21 + mi_12)
+            results['mi_x2_to_x1'] = mi_21
+            results['mi_x1_to_x2'] = mi_12
+            
+            # Conditional H(X|Y) = H(X,Y) - H(Y)
+            results['h_x1_given_x2'] = max(0.0, h_joint_21 - h_x2_true)
+            results['h_x2_given_x1'] = max(0.0, h_joint_12 - h_x1_true)
         
-        return {
-            'kl_x1_per_dim': float(kl_1),  # Average KL per dimension for X1 marginal
-            'kl_x2_per_dim': float(kl_2),  # Average KL per dimension for X2 marginal
-            'kl_sum_per_dim': kl_sum_per_dim,  # Sum of per-dim KLs across both marginals (normalized)
-            'kl_total_over_dims': kl_total_over_dims,  # Total KL over all dimensions (scales with dim)
-            # Legacy aliases for backward compatibility
-            # NOTE: kl_div_total is actually kl_sum_per_dim (sum of per-dim KLs), NOT total over dims
-            'kl_marginals_per_dim_sum': kl_sum_per_dim,
+        # Standard outputs
+        results.update({
             'kl_div_1': float(kl_1),
             'kl_div_2': float(kl_2),
+            'kl_div_total': float(kl_1 + kl_2),  # Sum of per-dim KLs
+            'kl_x1_per_dim': float(kl_1),
+            'kl_x2_per_dim': float(kl_2),
+            'kl_sum_per_dim': float(kl_1 + kl_2),
+            'kl_total_over_dims': float((kl_1 + kl_2) * dim),
+            'kl_marginals_per_dim_sum': float(kl_1 + kl_2),
             'kl_div_1_per_dim': float(kl_1),
             'kl_div_2_per_dim': float(kl_2),
-            'kl_per_dim_sum': kl_sum_per_dim,
-            'kl_div_total': kl_sum_per_dim,  # Alias for kl_sum_per_dim (sum of per-dim KLs, not total over dims)
-            'entropy_x1': float(h_x1),
-            'entropy_x2': float(h_x2),
-            'joint_entropy': float(h_joint),
-            'mutual_information': float(mutual_info),  # True↔generated MI proxy (0.5*(mi_21+mi_12))
-            'mutual_information_true_gen_proxy': float(mutual_info),  # Explicit alias for clarity
-            'mi_gen_gen': float(mi_gen_gen),  # Generated->generated MI (for reference)
-            'mi_x2_to_x1': float(mi_21),  # I(X2_true; X1_gen)
-            'mi_x1_to_x2': float(mi_12),  # I(X1_true; X2_gen)
-            'h_x1_given_x2': float(h_x1_given_x2),
-            'h_x2_given_x1': float(h_x2_given_x1),
-            'h_theoretical': float(h_theoretical),
-            'h_independent_joint': float(h_independent_joint),  # Added missing metric
-            'correlation': float(correlation),
-            'mae': float(mae),
-            'mae_x2_to_x1': float(mae_21),
-            'mae_x1_to_x2': float(mae_12),
+            'kl_per_dim_sum': float(kl_1 + kl_2),
             'mu1_learned': float(np.mean(mu1_learned)),
             'mu2_learned': float(np.mean(mu2_learned)),
             'std1_learned': float(np.mean(std1_learned)),
             'std2_learned': float(np.mean(std2_learned)),
-        }
+            'mae_x2_to_x1': float(mae_21),
+            'mae_x1_to_x2': float(mae_12),
+            'h_theoretical': dim * 1.4189,  # 0.5 * log(2*pi*e * 1^2) approx
+            'mutual_information_true_gen_proxy': results.get('mutual_information', 0.0),
+            'mi_gen_gen': results.get('mutual_information', 0.0),  # For backward compatibility
+            'h_independent_joint': results.get('entropy_x1', 0.0) + results.get('entropy_x2', 0.0) if not fast else np.nan,
+        })
+        
+        return results
 
 
 # ============================================================================
@@ -1607,7 +1433,11 @@ class DDMECPPOTrainer:
             cond_rep = None
 
         # 3) PPO epochs
+        # Make EXTRA sure actor parameters have gradients enabled here.
+        # They may have been toggled elsewhere when switching phases.
         self.actor.model.train()
+        for p in self.actor.model.parameters():
+            p.requires_grad = True
         ppo_obj_val = 0.0
         anchor_kl_val = 0.0
         ratio_mean = 0.0
@@ -3136,7 +2966,7 @@ class AblationRunner:
             epoch_metrics.append(metrics)
             
             # Generate checkpoint plot every epoch for better observability
-                self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
+            self._plot_checkpoint(epoch_metrics, checkpoint_dir, epoch, 'PPO', dim, f'kl_w={kl_weight:.1e}, clip={ppo_clip}, lr={lr}')
             
             # Log to wandb (include all key metrics)
             if self.config.use_wandb and WANDB_AVAILABLE:
