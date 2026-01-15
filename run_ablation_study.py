@@ -2736,8 +2736,8 @@ class AblationRunner:
                 })
             
             # Evaluate coupling quality after both phases
-            # Use fast mode only at final epoch (full eval every epoch for plots)
-            fast_eval = ((epoch + 1) != self.config.coupling_epochs)
+            # Always compute full metrics (entropy/MI) every epoch for monitoring and plots
+            fast_eval = False  # Changed: compute full metrics every epoch, not just final
             metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true, fast=fast_eval)
             metrics['epoch'] = epoch + 1
             # Use actual objective (reward - λ*KL) for loss (consistent with actor optimization)
@@ -2959,8 +2959,8 @@ class AblationRunner:
                 })
             
             # Evaluate coupling quality after both phases
-            # Use fast mode only at final epoch (full eval every epoch for plots)
-            fast_eval = ((epoch + 1) != self.config.coupling_epochs)
+            # Always compute full metrics (entropy/MI) every epoch for monitoring and plots
+            fast_eval = False  # Changed: compute full metrics every epoch, not just final
             metrics = self._evaluate_coupling(dim, cond_x1, cond_x2, x1_true=eval_x1_true, x2_true=eval_x2_true, fast=fast_eval)
             metrics['epoch'] = epoch + 1  # Epochs: 1, 2, 3... (epoch 0 is initial)
             # Use PPO objective for loss (consistent with actor objective)
