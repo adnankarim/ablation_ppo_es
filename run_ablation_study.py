@@ -174,10 +174,11 @@ class InformationMetrics:
         def gaussian_kl(m_p, s_p, m_q, s_q):
             # KL(P || Q)
             v_p, v_q = s_p**2, s_q**2
-            return 0.5 * (np.sum(np.log(v_q / (v_p + 1e-9))) - dim + np.sum(v_p / (v_q + 1e-9)) + np.sum((m_p - m_q)**2) / (v_q + 1e-9))
+            kl_val = 0.5 * (np.sum(np.log(v_q / (v_p + 1e-9))) - dim + np.sum(v_p / (v_q + 1e-9)) + np.sum((m_p - m_q)**2) / (v_q + 1e-9))
+            return np.asarray(kl_val).item()  # Ensure scalar extraction
         
-        kl_1 = gaussian_kl(mu1_learned, std1_learned, np.full(dim, target_mu1), np.full(dim, target_std1)) / dim
-        kl_2 = gaussian_kl(mu2_learned, std2_learned, np.full(dim, target_mu2), np.full(dim, target_std2)) / dim
+        kl_1 = np.asarray(gaussian_kl(mu1_learned, std1_learned, np.full(dim, target_mu1), np.full(dim, target_std1)) / dim).item()
+        kl_2 = np.asarray(gaussian_kl(mu2_learned, std2_learned, np.full(dim, target_mu2), np.full(dim, target_std2)) / dim).item()
         
         # --- 4. Information Metrics (Entropy & MI) ---
         # Initialize with NaNs or zeros
@@ -240,17 +241,17 @@ class InformationMetrics:
         
         # Standard outputs
         results.update({
-            'kl_div_1': float(kl_1),
-            'kl_div_2': float(kl_2),
-            'kl_div_total': float(kl_1 + kl_2),  # Sum of per-dim KLs
-            'kl_x1_per_dim': float(kl_1),
-            'kl_x2_per_dim': float(kl_2),
-            'kl_sum_per_dim': float(kl_1 + kl_2),
-            'kl_total_over_dims': float((kl_1 + kl_2) * dim),
-            'kl_marginals_per_dim_sum': float(kl_1 + kl_2),
-            'kl_div_1_per_dim': float(kl_1),
-            'kl_div_2_per_dim': float(kl_2),
-            'kl_per_dim_sum': float(kl_1 + kl_2),
+            'kl_div_1': kl_1,
+            'kl_div_2': kl_2,
+            'kl_div_total': kl_1 + kl_2,  # Sum of per-dim KLs
+            'kl_x1_per_dim': kl_1,
+            'kl_x2_per_dim': kl_2,
+            'kl_sum_per_dim': kl_1 + kl_2,
+            'kl_total_over_dims': (kl_1 + kl_2) * dim,
+            'kl_marginals_per_dim_sum': kl_1 + kl_2,
+            'kl_div_1_per_dim': kl_1,
+            'kl_div_2_per_dim': kl_2,
+            'kl_per_dim_sum': kl_1 + kl_2,
             'mu1_learned': float(np.mean(mu1_learned)),
             'mu2_learned': float(np.mean(mu2_learned)),
             'std1_learned': float(np.mean(std1_learned)),
