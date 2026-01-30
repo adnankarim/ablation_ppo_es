@@ -1787,9 +1787,16 @@ class AblationRunner:
     
     def run(self):
         """Run the complete ablation study."""
-        print("\n" + "="*80)
-        print("STARTING COMPREHENSIVE ABLATION STUDY")
-        print("="*80 + "\n")
+        pretrain_only = hasattr(self.config, 'pretrain_only') and self.config.pretrain_only
+        
+        if pretrain_only:
+            print("\n" + "="*80)
+            print("PRETRAINING MODE: Generating pretrained DDPM models only")
+            print("="*80 + "\n")
+        else:
+            print("\n" + "="*80)
+            print("STARTING COMPREHENSIVE ABLATION STUDY")
+            print("="*80 + "\n")
         
         start_time = time.time()
         
@@ -1815,6 +1822,11 @@ class AblationRunner:
             # Pretrain DDPM for this dimension
             print(f"[{dim}D] Step 1: Pretraining DDPM...")
             ddpm_x1, ddpm_x2 = self._pretrain_ddpm(dim)
+            
+            # If pretrain-only mode, skip ES/PPO experiments
+            if pretrain_only:
+                print(f"\n[{dim}D] Pretraining complete. Skipping ES/PPO experiments (--pretrain-only mode).")
+                continue
             
             # CRITICAL: Create single frozen eval set per dimension (shared across all configs)
             # This ensures fair comparison - all configs evaluated on identical test data.
@@ -1905,17 +1917,23 @@ class AblationRunner:
             # Store results
             self.all_results[dim] = dim_results
             
-            # Generate dimension summary
-            self._generate_dimension_summary(dim)
+            # Generate dimension summary (skip if pretrain-only)
+            if not pretrain_only:
+                self._generate_dimension_summary(dim)
         
-        # Generate overall summary
-        print("\n" + "="*80)
-        print("GENERATING OVERALL SUMMARY")
-        print("="*80 + "\n")
-        self._generate_overall_summary()
+        # Generate overall summary (skip if pretrain-only)
+        if not pretrain_only:
+            print("\n" + "="*80)
+            print("GENERATING OVERALL SUMMARY")
+            print("="*80 + "\n")
+            self._generate_overall_summary()
         
         total_time = time.time() - start_time
-        print(f"\nTotal ablation time: {total_time/3600:.2f} hours")
+        if pretrain_only:
+            print(f"\nPretraining complete!")
+            print(f"Total pretraining time: {total_time/3600:.2f} hours")
+        else:
+            print(f"\nTotal ablation time: {total_time/3600:.2f} hours")
         print(f"Results saved to: {self.output_dir}")
         
         if self.config.use_wandb and WANDB_AVAILABLE:
@@ -1931,24 +1949,7 @@ class AblationRunner:
         return x_norm * data_std + data_mean
     
     def _pretrain_ddpm(self, dim: int) -> Tuple[MultiDimDDPM, MultiDimDDPM]:
-        """Pretrain DDPM models for X1 and X2."""
-        # Helper: closed-form 1D Gaussian KL for diagnostics during pretraining
-        def _gaussian_kl_1d(mu: float, var: float, target_mu: float, target_var: float) -> float:
-            """KL( N(mu, var) || N(target_mu, target_var) ) for 1D Gaussians.
-            
-            Used purely for pretraining sanity checks; not part of ablation metrics.
-            """
-            var = max(float(var), 1e-8)
-            target_var = max(float(target_var), 1e-8)
-            mu = float(mu)
-            target_mu = float(target_mu)
-            return 0.5 * (
-                var / target_var
-                + (mu - target_mu) ** 2 / target_var
-                - 1.0
-                + math.log(target_var / var)
-            )
-
+        """Pretrain DDPM models for X1 and X2 with metrics tracking, plots, and CSV logging."""
         # Check if models already exist in persistent directory
         # CRITICAL: Include timesteps, hidden_dim, lr, and epochs in filename to prevent cache collisions
         # Extended tag includes beta schedule and hyperparameters to ensure retrain on hyperparameter changes
@@ -1959,6 +1960,10 @@ class AblationRunner:
         tag = f"{dim}d_T{self.config.ddpm_timesteps}_H{self.config.ddpm_hidden_dim}_lr{lr_str}_E{self.config.ddpm_epochs}_b{beta_start:g}-{beta_end_scaled:g}"
         model_x1_path = os.path.join(self.pretrained_models_dir, f"ddpm_x1_{tag}.pt")
         model_x2_path = os.path.join(self.pretrained_models_dir, f"ddpm_x2_{tag}.pt")
+        
+        # Create pretraining plots directory
+        pretrain_plots_dir = os.path.join(self.plots_dir, f'pretraining_{dim}D')
+        os.makedirs(pretrain_plots_dir, exist_ok=True)
         
         # Generate training data
         # CRITICAL: X1 std = sqrt(0.99) to match eval distribution and KL target
@@ -1987,6 +1992,10 @@ class AblationRunner:
         print(f"  [DATA] Normalized X1 and X2. X1: mean={x1_mean.mean().item():.4f}, std={x1_std.mean().item():.4f} -> normalized")
         print(f"  [DATA] Normalized X1 and X2. X2: mean={x2_mean.mean().item():.4f}, std={x2_std.mean().item():.4f} -> normalized")
         # ===========================
+        
+        # Track metrics for X1
+        x1_metrics = []
+        x1_trained = False
         
         # DDPM for X1
         if (self.config.reuse_pretrained and not self.config.retrain_ddpm and os.path.exists(model_x1_path)):
@@ -2024,21 +2033,7 @@ class AblationRunner:
             dataset = TensorDataset(x1_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
             
-            # DIAGNOSTIC: Check if parameters are updating
-            with torch.no_grad():
-                param_before = next(ddpm_x1.model.parameters()).clone()
-            
-            # Track metrics over epochs for time-series plots
-            epoch_metrics_x1 = {
-                'epoch': [],
-                'loss': [],
-                'kl': [],
-                'mean_norm': [],
-                'std_norm': [],
-                'mean_denorm': [],
-                'std_denorm': [],
-                'noise_mse': [],
-            }
+            plot_every = max(1, self.config.ddpm_epochs // 20)  # Plot ~20 times during training
             
             for epoch in range(self.config.ddpm_epochs):
                 losses = []
@@ -2050,294 +2045,30 @@ class AblationRunner:
                     losses.append(loss)
                     grad_norms.append(grad_norm)
                 
-                # DIAGNOSTIC: Check parameter update after first epoch
-                if epoch == 0:
-                    with torch.no_grad():
-                        param_after = next(ddpm_x1.model.parameters()).clone()
-                        param_delta = (param_after - param_before).abs().mean().item()
-                        avg_grad_norm = float(np.mean(grad_norms)) if grad_norms else 0.0
-                        print(f"      [DIAG] Parameter update: delta={param_delta:.8f} "
-                              f"(should be > 0 if training), avg_grad_norm={avg_grad_norm:.6f}")
+                avg_loss = np.mean(losses)
+                epoch_metric = {
+                    'epoch': epoch + 1,
+                    'model': 'X1',
+                    'loss': float(avg_loss),
+                    'dim': dim
+                }
+                x1_metrics.append(epoch_metric)
                 
-                avg_loss = float(np.mean(losses)) if losses else float("nan")
+                if (epoch + 1) % 20 == 0:
+                    print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
                 
-                # Print loss every epoch for observability
-                print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
-                
-                # Expensive diagnostics (sampling, KL, etc.) every 20 epochs or at the end
-                if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
-                    # === Pretraining diagnostics: samples, stats, KL, histograms ===
-                    try:
-                        with torch.no_grad():
-                            # Reduced diagnostic samples to prevent OOM/timeout (5k is enough for mean/std/KL)
-                            num_samples = 5000
-                            chunk_size = 1024 if dim <= 10 else 512
-                            samples = self._chunked_uncond_sample(ddpm_x1, num_samples, ddpm_x1.timesteps, chunk_size=chunk_size)
-                            # Explicitly move to CPU to avoid device mismatch
-                            samples_cpu = samples.detach().cpu().contiguous()
-
-                        # Aggregate scalar stats over all dims/samples for easy plotting
-                        mean_val_norm = float(samples_cpu.mean().item())
-                        var_val_norm = float(samples_cpu.var(unbiased=False).item())
-                        std_val_norm = float(math.sqrt(max(var_val_norm, 0.0)))
-                        
-                        # Denormalize for display (show what it means in original space)
-                        # Ensure samples_cpu is on CPU and stats are on CPU
-                        if dim in self.normalization_stats:
-                            stats = self.normalization_stats[dim]
-                            # Explicitly ensure both are on CPU
-                            samples_cpu_safe = samples_cpu.cpu() if samples_cpu.is_cuda else samples_cpu
-                            x1_std_cpu = stats['x1_std'].cpu() if stats['x1_std'].is_cuda else stats['x1_std']
-                            x1_mean_cpu = stats['x1_mean'].cpu() if stats['x1_mean'].is_cuda else stats['x1_mean']
-                            samples_denorm = samples_cpu_safe * x1_std_cpu + x1_mean_cpu
-                            mean_val_denorm = float(samples_denorm.mean().item())
-                            std_val_denorm = float(samples_denorm.std(unbiased=False).item())
-                        else:
-                            mean_val_denorm = mean_val_norm
-                            std_val_denorm = std_val_norm
-
-                        # DIAGNOSTIC: Compare real data stats vs generated stats (in normalized space)
-                        # Sample a batch from normalized training data to verify target distribution
-                        with torch.no_grad():
-                            # Generate normalized real data (same as training data)
-                            real_batch_raw = torch.randn(min(1000, num_samples), dim, device=self.config.device) * np.sqrt(0.99) + 2.0
-                            # Normalize using stored stats (move stats to device for GPU operations)
-                            if dim in self.normalization_stats:
-                                stats = self.normalization_stats[dim]
-                                x1_mean_dev = stats['x1_mean'].to(self.config.device)
-                                x1_std_dev = stats['x1_std'].to(self.config.device)
-                                real_batch = (real_batch_raw - x1_mean_dev) / x1_std_dev
-                            else:
-                                real_batch = real_batch_raw
-                            real_mean = float(real_batch.mean().item())
-                            real_std = float(real_batch.std(unbiased=False).item())
-
-                        # Target for X1 in normalized space: N(0, 1)
-                        target_mu1 = 0.0
-                        target_std1 = 1.0
-                        target_var1 = 1.0
-                        kl_val = float(_gaussian_kl_1d(mean_val_norm, var_val_norm, target_mu1, target_var1))
-
-                        # DIAGNOSTIC: Check what the model is predicting during sampling
-                        # Sample a small batch and check noise prediction quality
-                        # NOTE: Model was trained on normalized data, so we need to normalize test_x0
-                        with torch.no_grad():
-                            test_batch_size = 100
-                            test_x0_raw = torch.randn(test_batch_size, dim, device=self.config.device) * np.sqrt(0.99) + 2.0
-                            # Normalize test_x0 to match training data distribution
-                            if dim in self.normalization_stats:
-                                stats = self.normalization_stats[dim]
-                                x1_mean_dev = stats['x1_mean'].to(self.config.device)
-                                x1_std_dev = stats['x1_std'].to(self.config.device)
-                                test_x0 = (test_x0_raw - x1_mean_dev) / x1_std_dev
-                            else:
-                                test_x0 = test_x0_raw
-                            test_t = torch.randint(0, ddpm_x1.timesteps, (test_batch_size,), device=self.config.device)
-                            test_noise = torch.randn_like(test_x0)
-                            test_x_t = ddpm_x1.q_sample(test_x0, test_t, test_noise)
-                            test_eps_pred = ddpm_x1.model(test_x_t, test_t, ddpm_x1.t_scale)
-                            eps_pred_mean = float(test_eps_pred.mean().item())
-                            eps_pred_std = float(test_eps_pred.std().item())
-                            eps_target_mean = float(test_noise.mean().item())  # Should be ~0
-                            eps_target_std = float(test_noise.std().item())  # Should be ~1
-                            eps_mse = float(nn.functional.mse_loss(test_eps_pred, test_noise).item())
-                        
-                        # Denormalize for display (show what it means in original space)
-                        # Ensure samples_cpu is on CPU and stats are on CPU
-                        if dim in self.normalization_stats:
-                            stats = self.normalization_stats[dim]
-                            # Explicitly ensure both are on CPU
-                            samples_cpu_safe = samples_cpu.cpu() if samples_cpu.is_cuda else samples_cpu
-                            x1_std_cpu = stats['x1_std'].cpu() if stats['x1_std'].is_cuda else stats['x1_std']
-                            x1_mean_cpu = stats['x1_mean'].cpu() if stats['x1_mean'].is_cuda else stats['x1_mean']
-                            samples_denorm = samples_cpu_safe * x1_std_cpu + x1_mean_cpu
-                            mean_val_denorm = float(samples_denorm.mean().item())
-                            std_val_denorm = float(samples_denorm.std(unbiased=False).item())
-                        else:
-                            mean_val_denorm = mean_val_norm
-                            std_val_denorm = std_val_norm
-                        
-                        # Console output with KL + diagnostic stats
-                        print(f"    [DDPM X1] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
-                              f"KL: {kl_val:.6f}")
-                        print(f"      Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 2.0, {np.sqrt(0.99):.4f}) [DENORM]")
-                        print(f"      Mean: {mean_val_norm:.4f}, Std: {std_val_norm:.4f} (target: {target_mu1:.2f}, {target_std1:.4f}) [NORM]")
-                        print(f"      [DIAG] Real data (normalized): mean={real_mean:.4f}, std={real_std:.4f} | Generated (normalized): mean={mean_val_norm:.4f}, std={std_val_norm:.4f}")
-                        print(f"      [DIAG] Noise pred: mean={eps_pred_mean:.4f}, std={eps_pred_std:.4f} "
-                              f"(target: {eps_target_mean:.4f}, {eps_target_std:.4f}), MSE={eps_mse:.6f}")
-
-                        # Optional: noise prediction MSE on a held-out batch (diagnostic only)
-                        with torch.no_grad():
-                            if "x" in locals():
-                                eval_x = x
-                                bsz = eval_x.shape[0]
-                                t_eval = torch.randint(0, ddpm_x1.timesteps, (bsz,), device=self.config.device)
-                                noise_eval = torch.randn_like(eval_x)
-                                x_t_eval = ddpm_x1.q_sample(eval_x, t_eval, noise_eval)
-                                noise_pred = ddpm_x1.model(x_t_eval, t_eval, ddpm_x1.t_scale)
-                                noise_mse = float(nn.functional.mse_loss(noise_pred, noise_eval).item())
-                            else:
-                                noise_mse = float("nan")
-
-                        # WandB logging (namespaced under pretrain_x1/*)
-                        if self.config.use_wandb and WANDB_AVAILABLE:
-                            wandb.log(
-                                {
-                                    "pretrain_x1/loss": avg_loss,
-                                    "pretrain_x1/sample_mean_norm": mean_val_norm,
-                                    "pretrain_x1/sample_std_norm": std_val_norm,
-                                    "pretrain_x1/sample_var_norm": var_val_norm,
-                                    "pretrain_x1/sample_mean_denorm": mean_val_denorm,
-                                    "pretrain_x1/sample_std_denorm": std_val_denorm,
-                                    "pretrain_x1/kl_to_target": kl_val,
-                                    "pretrain_x1/noise_pred_mean": eps_pred_mean,
-                                    "pretrain_x1/noise_pred_std": eps_pred_std,
-                                    "pretrain_x1/noise_target_mean": eps_target_mean,
-                                    "pretrain_x1/noise_target_std": eps_target_std,
-                                    "pretrain_x1/noise_mse": eps_mse,
-                                    "pretrain_x1/real_data_mean_norm": real_mean,
-                                    "pretrain_x1/real_data_std_norm": real_std,
-                                    "pretrain_x1/epoch": epoch + 1,
-                                    "pretrain_x1/dim": dim,
-                                }
-                            )
-                            # Histogram of samples (ensure on CPU before numpy conversion)
-                            samples_cpu_hist = samples_cpu.cpu() if samples_cpu.is_cuda else samples_cpu
-                            wandb.log(
-                                {
-                                    "pretrain_x1/sample_hist": wandb.Histogram(
-                                        samples_cpu_hist.numpy().flatten()
-                                    )
-                                }
-                            )
-
-                        # Local histogram plot for reviewer-friendly sanity checks
-                        try:
-                            pretrain_dir = os.path.join(self.plots_dir, f"pretrain_{dim}d")
-                            os.makedirs(pretrain_dir, exist_ok=True)
-                            hist_path = os.path.join(
-                                pretrain_dir, f"ddpm_x1_hist_epoch_{epoch+1}.png"
-                            )
-                            plt.figure()
-                            # Ensure on CPU before numpy conversion
-                            samples_cpu_hist = samples_cpu.cpu().contiguous() if samples_cpu.is_cuda else samples_cpu
-                            plt.hist(
-                                samples_cpu_hist.numpy().flatten(),
-                                bins=100,
-                                density=True,
-                                alpha=0.8,
-                            )
-                            plt.title(f"DDPM X1 Pretrain Samples (dim={dim}, epoch={epoch+1})")
-                            plt.xlabel("x1")
-                            plt.ylabel("density")
-                            plt.tight_layout()
-                            plt.savefig(hist_path, dpi=120, bbox_inches="tight")
-                            plt.close()
-
-                            if self.config.use_wandb and WANDB_AVAILABLE:
-                                wandb.log({"pretrain_x1/sample_hist_plot": wandb.Image(hist_path)})
-                        except Exception as e:
-                            print(f"    [DDPM X1] Pretrain diagnostics plotting failed: {e}")
-                        
-                        # Store metrics for time-series plots
-                        epoch_metrics_x1['epoch'].append(epoch + 1)
-                        epoch_metrics_x1['loss'].append(avg_loss)
-                        epoch_metrics_x1['kl'].append(kl_val)
-                        epoch_metrics_x1['mean_norm'].append(mean_val_norm)
-                        epoch_metrics_x1['std_norm'].append(std_val_norm)
-                        epoch_metrics_x1['mean_denorm'].append(mean_val_denorm)
-                        epoch_metrics_x1['std_denorm'].append(std_val_denorm)
-                        epoch_metrics_x1['noise_mse'].append(eps_mse)
-                        
-                        # Create time-series plots periodically (every 20 epochs or at the end)
-                        if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
-                            try:
-                                pretrain_dir = os.path.join(self.plots_dir, f"pretrain_{dim}d")
-                                os.makedirs(pretrain_dir, exist_ok=True)
-                                ts_path = os.path.join(pretrain_dir, f"ddpm_x1_timeseries_epoch_{epoch+1}.png")
-                                
-                                fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-                                epochs_list = epoch_metrics_x1['epoch']
-                                
-                                # Loss
-                                axes[0, 0].plot(epochs_list, epoch_metrics_x1['loss'], 'b-', linewidth=2)
-                                axes[0, 0].set_xlabel('Epoch')
-                                axes[0, 0].set_ylabel('Loss')
-                                axes[0, 0].set_title('Training Loss')
-                                axes[0, 0].grid(True, alpha=0.3)
-                                
-                                # KL Divergence
-                                axes[0, 1].plot(epochs_list, epoch_metrics_x1['kl'], 'r-', linewidth=2)
-                                axes[0, 1].set_xlabel('Epoch')
-                                axes[0, 1].set_ylabel('KL Divergence')
-                                axes[0, 1].set_title('KL to Target (Normalized)')
-                                axes[0, 1].grid(True, alpha=0.3)
-                                
-                                # Mean (Normalized)
-                                axes[0, 2].plot(epochs_list, epoch_metrics_x1['mean_norm'], 'g-', linewidth=2, label='Generated')
-                                axes[0, 2].axhline(y=0.0, color='r', linestyle='--', label='Target')
-                                axes[0, 2].set_xlabel('Epoch')
-                                axes[0, 2].set_ylabel('Mean')
-                                axes[0, 2].set_title('Mean (Normalized)')
-                                axes[0, 2].legend()
-                                axes[0, 2].grid(True, alpha=0.3)
-                                
-                                # Std (Normalized)
-                                axes[1, 0].plot(epochs_list, epoch_metrics_x1['std_norm'], 'g-', linewidth=2, label='Generated')
-                                axes[1, 0].axhline(y=1.0, color='r', linestyle='--', label='Target')
-                                axes[1, 0].set_xlabel('Epoch')
-                                axes[1, 0].set_ylabel('Std')
-                                axes[1, 0].set_title('Std (Normalized)')
-                                axes[1, 0].legend()
-                                axes[1, 0].grid(True, alpha=0.3)
-                                
-                                # Mean (Denormalized)
-                                axes[1, 1].plot(epochs_list, epoch_metrics_x1['mean_denorm'], 'm-', linewidth=2, label='Generated')
-                                axes[1, 1].axhline(y=2.0, color='r', linestyle='--', label='Target')
-                                axes[1, 1].set_xlabel('Epoch')
-                                axes[1, 1].set_ylabel('Mean')
-                                axes[1, 1].set_title('Mean (Denormalized)')
-                                axes[1, 1].legend()
-                                axes[1, 1].grid(True, alpha=0.3)
-                                
-                                # Noise MSE
-                                axes[1, 2].plot(epochs_list, epoch_metrics_x1['noise_mse'], 'c-', linewidth=2)
-                                axes[1, 2].set_xlabel('Epoch')
-                                axes[1, 2].set_ylabel('MSE')
-                                axes[1, 2].set_title('Noise Prediction MSE')
-                                axes[1, 2].grid(True, alpha=0.3)
-                                
-                                plt.tight_layout()
-                                plt.savefig(ts_path, dpi=120, bbox_inches="tight")
-                                plt.close()
-                                
-                                if self.config.use_wandb and WANDB_AVAILABLE:
-                                    wandb.log({"pretrain_x1/timeseries_plot": wandb.Image(ts_path)})
-                            except Exception as e:
-                                print(f"    [DDPM X1] Time-series plotting failed: {e}")
-                    except Exception as e:
-                        print(f"    [DDPM X1] Pretrain diagnostics failed: {e}")
+                # Generate plot periodically
+                if (epoch + 1) % plot_every == 0 or (epoch + 1) == self.config.ddpm_epochs:
+                    self._plot_pretraining(x1_metrics, x2_metrics, pretrain_plots_dir, dim, 'X1', 'X2')
+                    self._save_pretraining_metrics_to_csv(x1_metrics, x2_metrics, pretrain_plots_dir, dim)
             
             ddpm_x1.save(model_x1_path)
             print(f"  [SAVE] Saved DDPM X1 to {model_x1_path}")
-            
-            # DIAGNOSTIC: End-to-end truth test for X1
-            with torch.no_grad():
-                test_samples_x1_norm = self._chunked_uncond_sample(ddpm_x1, 10000, ddpm_x1.timesteps, chunk_size=2048)
-                # Denormalize if normalization was used
-                if dim in self.normalization_stats:
-                    stats = self.normalization_stats[dim]
-                    # Ensure both tensors are on CPU for denormalization
-                    test_samples_x1_norm_cpu = test_samples_x1_norm.cpu() if test_samples_x1_norm.is_cuda else test_samples_x1_norm
-                    x1_std_cpu = stats['x1_std'].cpu() if stats['x1_std'].is_cuda else stats['x1_std']
-                    x1_mean_cpu = stats['x1_mean'].cpu() if stats['x1_mean'].is_cuda else stats['x1_mean']
-                    test_samples_x1 = test_samples_x1_norm_cpu * x1_std_cpu + x1_mean_cpu
-                else:
-                    test_samples_x1 = test_samples_x1_norm.cpu() if test_samples_x1_norm.is_cuda else test_samples_x1_norm
-                x1_final_mean = float(test_samples_x1.mean().item())
-                x1_final_std = float(test_samples_x1.std(unbiased=False).item())
-            print(f"  [FINAL CHECK]")
-            print(f"  X1 mean/std: {x1_final_mean:.4f}, {x1_final_std:.4f} (target: 2.0, {np.sqrt(0.99):.4f})")
+            x1_trained = True
+        
+        # Track metrics for X2
+        x2_metrics = []
+        x2_trained = False
         
         # DDPM for X2
         if (self.config.reuse_pretrained and not self.config.retrain_ddpm and os.path.exists(model_x2_path)):
@@ -2393,17 +2124,7 @@ class AblationRunner:
             dataset = TensorDataset(x2_data)
             dataloader = DataLoader(dataset, batch_size=self.config.ddpm_batch_size, shuffle=True)
             
-            # Track metrics over epochs for time-series plots
-            epoch_metrics_x2 = {
-                'epoch': [],
-                'loss': [],
-                'kl': [],
-                'mean_norm': [],
-                'std_norm': [],
-                'mean_denorm': [],
-                'std_denorm': [],
-                'noise_mse': [],
-            }
+            plot_every = max(1, self.config.ddpm_epochs // 20)  # Plot ~20 times during training
             
             for epoch in range(self.config.ddpm_epochs):
                 losses = []
@@ -2412,264 +2133,32 @@ class AblationRunner:
                     loss, _ = ddpm_x2.train_step(x)  # grad_norm not needed for X2 diagnostics
                     losses.append(loss)
                 
-                avg_loss = float(np.mean(losses)) if losses else float("nan")
+                avg_loss = np.mean(losses)
+                epoch_metric = {
+                    'epoch': epoch + 1,
+                    'model': 'X2',
+                    'loss': float(avg_loss),
+                    'dim': dim
+                }
+                x2_metrics.append(epoch_metric)
                 
-                # Print loss every epoch for observability
-                print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
+                if (epoch + 1) % 20 == 0:
+                    print(f"    Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}")
                 
-                # Expensive diagnostics (sampling, KL, etc.) every 20 epochs or at the end
-                if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
-                    # === Pretraining diagnostics: samples, stats, KL, histograms ===
-                    try:
-                        with torch.no_grad():
-                            # Reduced diagnostic samples to prevent OOM/timeout (5k is enough for mean/std/KL)
-                            num_samples = 5000
-                            chunk_size = 1024 if dim <= 10 else 512
-                            samples = self._chunked_uncond_sample(ddpm_x2, num_samples, ddpm_x2.timesteps, chunk_size=chunk_size)
-                            samples_cpu = samples.detach().cpu()
-
-                        mean_val = float(samples_cpu.mean().item())
-                        var_val = float(samples_cpu.var(unbiased=False).item())
-                        std_val = float(math.sqrt(max(var_val, 0.0)))
-                        
-                        # Denormalize for display (show what it means in original space)
-                        # Ensure samples_cpu is on CPU and stats are on CPU
-                        if dim in self.normalization_stats:
-                            stats = self.normalization_stats[dim]
-                            # Explicitly ensure both are on CPU
-                            samples_cpu_safe = samples_cpu.cpu() if samples_cpu.is_cuda else samples_cpu
-                            x2_std_cpu = stats['x2_std'].cpu() if stats['x2_std'].is_cuda else stats['x2_std']
-                            x2_mean_cpu = stats['x2_mean'].cpu() if stats['x2_mean'].is_cuda else stats['x2_mean']
-                            samples_denorm = samples_cpu_safe * x2_std_cpu + x2_mean_cpu
-                            mean_val_denorm = float(samples_denorm.mean().item())
-                            std_val_denorm = float(samples_denorm.std(unbiased=False).item())
-                        else:
-                            mean_val_denorm = mean_val
-                            std_val_denorm = std_val
-
-                        # Target for X2 in normalized space: N(0, 1)
-                        target_mu2 = 0.0
-                        target_std2 = 1.0
-                        target_var2 = 1.0
-                        kl_val = float(_gaussian_kl_1d(mean_val, var_val, target_mu2, target_var2))
-
-                        # Console output with KL + diagnostic stats
-                        print(f"    [DDPM X2] Epoch {epoch+1}/{self.config.ddpm_epochs}, Loss: {avg_loss:.4f}, "
-                              f"KL: {kl_val:.6f}")
-                        print(f"      Mean: {mean_val_denorm:.4f}, Std: {std_val_denorm:.4f} (target: 10.0, 1.0) [DENORM]")
-                        print(f"      Mean: {mean_val:.4f}, Std: {std_val:.4f} (target: {target_mu2:.2f}, {target_std2:.4f}) [NORM]")
-                        print(f"      [DIAG] Real data (normalized): mean={real_mean:.4f}, std={real_std:.4f} | Generated (normalized): mean={mean_val:.4f}, std={std_val:.4f}")
-                        print(f"      [DIAG] Noise pred: mean={eps_pred_mean:.4f}, std={eps_pred_std:.4f} "
-                              f"(target: {eps_target_mean:.4f}, {eps_target_std:.4f}), MSE={eps_mse:.6f}")
-
-                        # Optional noise prediction MSE (diagnostic only)
-                        with torch.no_grad():
-                            if "x" in locals():
-                                eval_x = x
-                                bsz = eval_x.shape[0]
-                                t_eval = torch.randint(0, ddpm_x2.timesteps, (bsz,), device=self.config.device)
-                                noise_eval = torch.randn_like(eval_x)
-                                x_t_eval = ddpm_x2.q_sample(eval_x, t_eval, noise_eval)
-                                noise_pred = ddpm_x2.model(x_t_eval, t_eval, ddpm_x2.t_scale)
-                                noise_mse = float(nn.functional.mse_loss(noise_pred, noise_eval).item())
-                            else:
-                                noise_mse = float("nan")
-
-                        # Compute noise prediction stats for X2 (similar to X1)
-                        with torch.no_grad():
-                            test_batch_size = 100
-                            test_x0_raw = torch.randn(test_batch_size, dim, device=self.config.device) * 1.0 + 10.0
-                            # Normalize test_x0 to match training data distribution
-                            if dim in self.normalization_stats:
-                                stats = self.normalization_stats[dim]
-                                x2_mean_dev = stats['x2_mean'].to(self.config.device)
-                                x2_std_dev = stats['x2_std'].to(self.config.device)
-                                test_x0 = (test_x0_raw - x2_mean_dev) / x2_std_dev
-                            else:
-                                test_x0 = test_x0_raw
-                            test_t = torch.randint(0, ddpm_x2.timesteps, (test_batch_size,), device=self.config.device)
-                            test_noise = torch.randn_like(test_x0)
-                            test_x_t = ddpm_x2.q_sample(test_x0, test_t, test_noise)
-                            test_eps_pred = ddpm_x2.model(test_x_t, test_t, ddpm_x2.t_scale)
-                            eps_pred_mean = float(test_eps_pred.mean().item())
-                            eps_pred_std = float(test_eps_pred.std().item())
-                            eps_target_mean = float(test_noise.mean().item())
-                            eps_target_std = float(test_noise.std().item())
-                            eps_mse = float(nn.functional.mse_loss(test_eps_pred, test_noise).item())
-                        
-                        # Get real data stats for X2
-                        with torch.no_grad():
-                            real_batch = x2_data[torch.randint(0, len(x2_data), (1000,))]
-                            real_mean = float(real_batch.mean().item())
-                            real_std = float(real_batch.std(unbiased=False).item())
-
-                        if self.config.use_wandb and WANDB_AVAILABLE:
-                            wandb.log(
-                                {
-                                    "pretrain_x2/loss": avg_loss,
-                                    "pretrain_x2/sample_mean_norm": mean_val,
-                                    "pretrain_x2/sample_std_norm": std_val,
-                                    "pretrain_x2/sample_var_norm": var_val,
-                                    "pretrain_x2/sample_mean_denorm": mean_val_denorm,
-                                    "pretrain_x2/sample_std_denorm": std_val_denorm,
-                                    "pretrain_x2/kl_to_target": kl_val,
-                                    "pretrain_x2/noise_pred_mean": eps_pred_mean,
-                                    "pretrain_x2/noise_pred_std": eps_pred_std,
-                                    "pretrain_x2/noise_target_mean": eps_target_mean,
-                                    "pretrain_x2/noise_target_std": eps_target_std,
-                                    "pretrain_x2/noise_mse": eps_mse,
-                                    "pretrain_x2/real_data_mean_norm": real_mean,
-                                    "pretrain_x2/real_data_std_norm": real_std,
-                                    "pretrain_x2/epoch": epoch + 1,
-                                    "pretrain_x2/dim": dim,
-                                }
-                            )
-                            # Histogram of samples (ensure on CPU before numpy conversion)
-                            samples_cpu_hist = samples_cpu.cpu().contiguous() if samples_cpu.is_cuda else samples_cpu
-                            wandb.log(
-                                {
-                                    "pretrain_x2/sample_hist": wandb.Histogram(
-                                        samples_cpu_hist.numpy().flatten()
-                                    )
-                                }
-                            )
-
-                        # Local histogram plot
-                        try:
-                            pretrain_dir = os.path.join(self.plots_dir, f"pretrain_{dim}d")
-                            os.makedirs(pretrain_dir, exist_ok=True)
-                            hist_path = os.path.join(
-                                pretrain_dir, f"ddpm_x2_hist_epoch_{epoch+1}.png"
-                            )
-                            plt.figure()
-                            # Ensure on CPU before numpy conversion
-                            samples_cpu_hist = samples_cpu.cpu().contiguous() if samples_cpu.is_cuda else samples_cpu
-                            plt.hist(
-                                samples_cpu_hist.numpy().flatten(),
-                                bins=100,
-                                density=True,
-                                alpha=0.8,
-                            )
-                            plt.title(f"DDPM X2 Pretrain Samples (dim={dim}, epoch={epoch+1})")
-                            plt.xlabel("x2")
-                            plt.ylabel("density")
-                            plt.tight_layout()
-                            plt.savefig(hist_path, dpi=120, bbox_inches="tight")
-                            plt.close()
-
-                            if self.config.use_wandb and WANDB_AVAILABLE:
-                                wandb.log({"pretrain_x2/sample_hist_plot": wandb.Image(hist_path)})
-                        except Exception as e:
-                            print(f"    [DDPM X2] Pretrain diagnostics plotting failed: {e}")
-                        
-                        # Store metrics for time-series plots
-                        epoch_metrics_x2['epoch'].append(epoch + 1)
-                        epoch_metrics_x2['loss'].append(avg_loss)
-                        epoch_metrics_x2['kl'].append(kl_val)
-                        epoch_metrics_x2['mean_norm'].append(mean_val)
-                        epoch_metrics_x2['std_norm'].append(std_val)
-                        epoch_metrics_x2['mean_denorm'].append(mean_val_denorm)
-                        epoch_metrics_x2['std_denorm'].append(std_val_denorm)
-                        epoch_metrics_x2['noise_mse'].append(eps_mse)
-                        
-                        # Create time-series plots periodically (every 20 epochs or at the end)
-                        if (epoch + 1) % 20 == 0 or (epoch + 1) == self.config.ddpm_epochs:
-                            try:
-                                pretrain_dir = os.path.join(self.plots_dir, f"pretrain_{dim}d")
-                                os.makedirs(pretrain_dir, exist_ok=True)
-                                ts_path = os.path.join(pretrain_dir, f"ddpm_x2_timeseries_epoch_{epoch+1}.png")
-                                
-                                fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-                                epochs_list = epoch_metrics_x2['epoch']
-                                
-                                # Loss
-                                axes[0, 0].plot(epochs_list, epoch_metrics_x2['loss'], 'b-', linewidth=2)
-                                axes[0, 0].set_xlabel('Epoch')
-                                axes[0, 0].set_ylabel('Loss')
-                                axes[0, 0].set_title('Training Loss')
-                                axes[0, 0].grid(True, alpha=0.3)
-                                
-                                # KL Divergence
-                                axes[0, 1].plot(epochs_list, epoch_metrics_x2['kl'], 'r-', linewidth=2)
-                                axes[0, 1].set_xlabel('Epoch')
-                                axes[0, 1].set_ylabel('KL Divergence')
-                                axes[0, 1].set_title('KL to Target (Normalized)')
-                                axes[0, 1].grid(True, alpha=0.3)
-                                
-                                # Mean (Normalized)
-                                axes[0, 2].plot(epochs_list, epoch_metrics_x2['mean_norm'], 'g-', linewidth=2, label='Generated')
-                                axes[0, 2].axhline(y=0.0, color='r', linestyle='--', label='Target')
-                                axes[0, 2].set_xlabel('Epoch')
-                                axes[0, 2].set_ylabel('Mean')
-                                axes[0, 2].set_title('Mean (Normalized)')
-                                axes[0, 2].legend()
-                                axes[0, 2].grid(True, alpha=0.3)
-                                
-                                # Std (Normalized)
-                                axes[1, 0].plot(epochs_list, epoch_metrics_x2['std_norm'], 'g-', linewidth=2, label='Generated')
-                                axes[1, 0].axhline(y=1.0, color='r', linestyle='--', label='Target')
-                                axes[1, 0].set_xlabel('Epoch')
-                                axes[1, 0].set_ylabel('Std')
-                                axes[1, 0].set_title('Std (Normalized)')
-                                axes[1, 0].legend()
-                                axes[1, 0].grid(True, alpha=0.3)
-                                
-                                # Mean (Denormalized)
-                                axes[1, 1].plot(epochs_list, epoch_metrics_x2['mean_denorm'], 'm-', linewidth=2, label='Generated')
-                                axes[1, 1].axhline(y=10.0, color='r', linestyle='--', label='Target')
-                                axes[1, 1].set_xlabel('Epoch')
-                                axes[1, 1].set_ylabel('Mean')
-                                axes[1, 1].set_title('Mean (Denormalized)')
-                                axes[1, 1].legend()
-                                axes[1, 1].grid(True, alpha=0.3)
-                                
-                                # Noise MSE
-                                axes[1, 2].plot(epochs_list, epoch_metrics_x2['noise_mse'], 'c-', linewidth=2)
-                                axes[1, 2].set_xlabel('Epoch')
-                                axes[1, 2].set_ylabel('MSE')
-                                axes[1, 2].set_title('Noise Prediction MSE')
-                                axes[1, 2].grid(True, alpha=0.3)
-                                
-                                plt.tight_layout()
-                                plt.savefig(ts_path, dpi=120, bbox_inches="tight")
-                                plt.close()
-                                
-                                if self.config.use_wandb and WANDB_AVAILABLE:
-                                    wandb.log({"pretrain_x2/timeseries_plot": wandb.Image(ts_path)})
-                            except Exception as e:
-                                print(f"    [DDPM X2] Time-series plotting failed: {e}")
-                    except Exception as e:
-                        print(f"    [DDPM X2] Pretrain diagnostics failed: {e}")
+                # Generate plot periodically
+                if (epoch + 1) % plot_every == 0 or (epoch + 1) == self.config.ddpm_epochs:
+                    self._plot_pretraining(x1_metrics, x2_metrics, pretrain_plots_dir, dim, 'X1', 'X2')
+                    self._save_pretraining_metrics_to_csv(x1_metrics, x2_metrics, pretrain_plots_dir, dim)
             
             ddpm_x2.save(model_x2_path)
             print(f"  [SAVE] Saved DDPM X2 to {model_x2_path}")
-            
-            # DIAGNOSTIC: End-to-end truth test for X2
-            with torch.no_grad():
-                test_samples_x2_norm = self._chunked_uncond_sample(ddpm_x2, 10000, ddpm_x2.timesteps, chunk_size=2048)
-                # Denormalize if normalization was used
-                if dim in self.normalization_stats:
-                    stats = self.normalization_stats[dim]
-                    # Ensure both tensors are on CPU for denormalization
-                    test_samples_x2_norm_cpu = test_samples_x2_norm.cpu() if test_samples_x2_norm.is_cuda else test_samples_x2_norm
-                    x2_std_cpu = stats['x2_std'].cpu() if stats['x2_std'].is_cuda else stats['x2_std']
-                    x2_mean_cpu = stats['x2_mean'].cpu() if stats['x2_mean'].is_cuda else stats['x2_mean']
-                    test_samples_x2 = test_samples_x2_norm_cpu * x2_std_cpu + x2_mean_cpu
-                else:
-                    test_samples_x2 = test_samples_x2_norm.cpu() if test_samples_x2_norm.is_cuda else test_samples_x2_norm
-                x2_final_mean = float(test_samples_x2.mean().item())
-                x2_final_std = float(test_samples_x2.std(unbiased=False).item())
-            print(f"  [FINAL CHECK]")
-            print(f"  X2 mean/std: {x2_final_mean:.4f}, {x2_final_std:.4f} (target: 10.0, 1.0)")
+            x2_trained = True
         
-        # CRITICAL: Freeze pretrained models before returning (they will be used as anchors)
-        # This ensures they're in eval mode and gradients are disabled
-        ddpm_x1.model.eval()
-        for p in ddpm_x1.model.parameters():
-            p.requires_grad = False
-        ddpm_x2.model.eval()
-        for p in ddpm_x2.model.parameters():
-            p.requires_grad = False
+        # Final plot and CSV save if models were trained
+        if x1_trained or x2_trained:
+            self._plot_pretraining(x1_metrics, x2_metrics, pretrain_plots_dir, dim, 'X1', 'X2')
+            self._save_pretraining_metrics_to_csv(x1_metrics, x2_metrics, pretrain_plots_dir, dim)
+            print(f"  [PLOT] Pretraining plots saved to {pretrain_plots_dir}")
         
         return ddpm_x1, ddpm_x2
     
@@ -3558,6 +3047,160 @@ Learned vs Target:
         plot_path = os.path.join(checkpoint_dir, plot_filename)
         plt.savefig(plot_path, dpi=150, bbox_inches='tight')
         plt.close()
+    
+    def _plot_pretraining(self, x1_metrics: List[Dict], x2_metrics: List[Dict], 
+                         plots_dir: str, dim: int, model1_name: str = 'X1', model2_name: str = 'X2'):
+        """Generate comprehensive pretraining plot for DDPM models."""
+        if not x1_metrics and not x2_metrics:
+            return
+        
+        fig = plt.figure(figsize=(16, 10))
+        gs = GridSpec(2, 2, figure=fig, hspace=0.3, wspace=0.3)
+        
+        # Helper function to safely get finite values
+        def fin(x, default=0.0):
+            try:
+                x = float(x)
+                return x if np.isfinite(x) else default
+            except Exception:
+                return default
+        
+        # Plot 1: X1 Loss over epochs
+        if x1_metrics:
+            ax1 = fig.add_subplot(gs[0, 0])
+            epochs_x1 = [m['epoch'] for m in x1_metrics]
+            losses_x1 = [fin(m.get('loss', 0.0)) for m in x1_metrics]
+            ax1.plot(epochs_x1, losses_x1, 'b-', linewidth=2, marker='o', label=f'{model1_name} Loss', markersize=4)
+            ax1.set_xlabel('Epoch')
+            ax1.set_ylabel('Loss')
+            ax1.set_title(f'{model1_name} Pretraining Loss')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            ax1.set_yscale('log')  # Log scale for better visualization
+        
+        # Plot 2: X2 Loss over epochs
+        if x2_metrics:
+            ax2 = fig.add_subplot(gs[0, 1])
+            epochs_x2 = [m['epoch'] for m in x2_metrics]
+            losses_x2 = [fin(m.get('loss', 0.0)) for m in x2_metrics]
+            ax2.plot(epochs_x2, losses_x2, 'r-', linewidth=2, marker='o', label=f'{model2_name} Loss', markersize=4)
+            ax2.set_xlabel('Epoch')
+            ax2.set_ylabel('Loss')
+            ax2.set_title(f'{model2_name} Pretraining Loss')
+            ax2.legend()
+            ax2.grid(True, alpha=0.3)
+            ax2.set_yscale('log')  # Log scale for better visualization
+        
+        # Plot 3: Combined loss comparison
+        ax3 = fig.add_subplot(gs[1, 0])
+        if x1_metrics:
+            epochs_x1 = [m['epoch'] for m in x1_metrics]
+            losses_x1 = [fin(m.get('loss', 0.0)) for m in x1_metrics]
+            ax3.plot(epochs_x1, losses_x1, 'b-', linewidth=2, marker='o', label=f'{model1_name}', markersize=4)
+        if x2_metrics:
+            epochs_x2 = [m['epoch'] for m in x2_metrics]
+            losses_x2 = [fin(m.get('loss', 0.0)) for m in x2_metrics]
+            ax3.plot(epochs_x2, losses_x2, 'r-', linewidth=2, marker='s', label=f'{model2_name}', markersize=4)
+        ax3.set_xlabel('Epoch')
+        ax3.set_ylabel('Loss')
+        ax3.set_title('Combined Pretraining Loss Comparison')
+        ax3.legend()
+        ax3.grid(True, alpha=0.3)
+        ax3.set_yscale('log')
+        
+        # Plot 4: Summary statistics
+        ax4 = fig.add_subplot(gs[1, 1])
+        ax4.axis('off')
+        
+        summary_lines = [f"DDPM Pretraining Summary - {dim}D", ""]
+        
+        if x1_metrics:
+            final_loss_x1 = fin(x1_metrics[-1].get('loss', 0.0))
+            initial_loss_x1 = fin(x1_metrics[0].get('loss', 0.0)) if x1_metrics else 0.0
+            improvement_x1 = ((initial_loss_x1 - final_loss_x1) / initial_loss_x1 * 100) if initial_loss_x1 > 0 else 0.0
+            summary_lines.extend([
+                f"{model1_name} Model:",
+                f"  Epochs: {len(x1_metrics)}",
+                f"  Initial Loss: {initial_loss_x1:.6f}",
+                f"  Final Loss: {final_loss_x1:.6f}",
+                f"  Improvement: {improvement_x1:.2f}%",
+                ""
+            ])
+        
+        if x2_metrics:
+            final_loss_x2 = fin(x2_metrics[-1].get('loss', 0.0))
+            initial_loss_x2 = fin(x2_metrics[0].get('loss', 0.0)) if x2_metrics else 0.0
+            improvement_x2 = ((initial_loss_x2 - final_loss_x2) / initial_loss_x2 * 100) if initial_loss_x2 > 0 else 0.0
+            summary_lines.extend([
+                f"{model2_name} Model:",
+                f"  Epochs: {len(x2_metrics)}",
+                f"  Initial Loss: {initial_loss_x2:.6f}",
+                f"  Final Loss: {final_loss_x2:.6f}",
+                f"  Improvement: {improvement_x2:.2f}%",
+                ""
+            ])
+        
+        summary_text = "\n".join(summary_lines)
+        ax4.text(0.1, 0.5, summary_text, fontsize=11, family='monospace',
+                verticalalignment='center', transform=ax4.transAxes,
+                bbox=dict(boxstyle='round', facecolor='lightblue', alpha=0.3))
+        
+        plt.suptitle(f'DDPM Pretraining Progress - {dim}D', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        
+        # Save plot
+        plot_path = os.path.join(plots_dir, 'pretraining_progress.png')
+        plt.savefig(plot_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        # Log to wandb if available
+        if self.config.use_wandb and WANDB_AVAILABLE:
+            wandb.log({f'{dim}D/pretraining_plot': wandb.Image(plot_path)})
+    
+    def _save_pretraining_metrics_to_csv(self, x1_metrics: List[Dict], x2_metrics: List[Dict], 
+                                         plots_dir: str, dim: int):
+        """Save pretraining metrics to CSV files."""
+        import csv
+        
+        # Save X1 metrics
+        if x1_metrics:
+            x1_csv_path = os.path.join(plots_dir, 'pretraining_X1_metrics.csv')
+            fieldnames = ['epoch', 'model', 'loss', 'dim']
+            with open(x1_csv_path, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for metrics in x1_metrics:
+                    row = {k: metrics.get(k, "") for k in fieldnames}
+                    writer.writerow(row)
+        
+        # Save X2 metrics
+        if x2_metrics:
+            x2_csv_path = os.path.join(plots_dir, 'pretraining_X2_metrics.csv')
+            fieldnames = ['epoch', 'model', 'loss', 'dim']
+            with open(x2_csv_path, 'w', newline='') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for metrics in x2_metrics:
+                    row = {k: metrics.get(k, "") for k in fieldnames}
+                    writer.writerow(row)
+        
+        # Save combined metrics
+        if x1_metrics or x2_metrics:
+            combined_csv_path = os.path.join(plots_dir, 'pretraining_combined_metrics.csv')
+            all_metrics = []
+            if x1_metrics:
+                all_metrics.extend(x1_metrics)
+            if x2_metrics:
+                all_metrics.extend(x2_metrics)
+            
+            if all_metrics:
+                fieldnames = ['epoch', 'model', 'loss', 'dim']
+                with open(combined_csv_path, 'w', newline='') as csvfile:
+                    writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    for metrics in all_metrics:
+                        row = {k: metrics.get(k, "") for k in fieldnames}
+                        writer.writerow(row)
     
     def _score_config(self, metrics: Dict) -> float:
         """
@@ -4513,6 +4156,8 @@ def main():
                        help="Reuse existing pretrained DDPM models if available (default)")
     parser.add_argument("--no-reuse-pretrained", dest='reuse_pretrained', action="store_false",
                        help="Same as --retrain-ddpm (train from scratch)")
+    parser.add_argument("--pretrain-only", action="store_true",
+                       help="Only run pretraining (generate pretrained models with plots and metrics, skip ES/PPO experiments)")
     
     # Subsetting controls (for job arrays / incremental ablations)
     parser.add_argument("--only-dim", type=int, default=None,
@@ -4568,6 +4213,7 @@ def main():
     config.es_config_idx = args.es_config_idx
     config.ppo_config_idx = args.ppo_config_idx
     config.retrain_ddpm = args.retrain_ddpm
+    config.pretrain_only = getattr(args, 'pretrain_only', False)
     
     # Run ablation study
     runner = AblationRunner(config)
